@@ -233,17 +233,62 @@ def print_active_activations(records: list[dict]) -> None:
             print(f"     smsText={sms_text}")
 
 
+def find_activation_by_id(records: list[dict], activation_id: str) -> dict | None:
+    wanted = str(activation_id).strip()
+    for item in records:
+        if str(item.get("activationId", "")).strip() == wanted:
+            return item
+    return None
+
+
+def get_sms_payload_fields(record: dict) -> list[str]:
+    fields = []
+    for field_name in ("smsCode", "smsText"):
+        if str(record.get(field_name) or "").strip():
+            fields.append(field_name)
+    return fields
+
+
+def validate_records_payload(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return payload["data"]
+    raise ValueError(f"异常响应: {payload}")
+
 def main():
     configure_stdout()
     args = parse_args()
 
     try:
+        payload = get_active_activations(start=args.start, limit=args.limit)
+        records = validate_records_payload(payload)
+
         if args.set_status_id:
+            print("[setStatus 前活动激活列表]")
+            print_active_activations(records)
+            target = find_activation_by_id(records, args.set_status_id)
+            if target is None:
+                print(f"[跳过] 当前活动激活列表里没有 id={args.set_status_id}，不发送 setStatus")
+                return
+
+            sms_payload_fields = get_sms_payload_fields(target)
+            if int(args.status) == 8 and sms_payload_fields:
+                fields_text = "/".join(sms_payload_fields)
+                print(
+                    f"[warning] 当前激活 id={args.set_status_id} 已返回 {fields_text}，"
+                    "表示服务已生效；不发送 status=8 取消激活/退款请求。"
+                    "如需标记完成，请使用参数 --status 6，即 status=6(完成激活)"
+                )
+                return
+
+            print(f"[命中] 当前活动激活列表存在 id={args.set_status_id}，准备发送 setStatus")
             set_activation_status(activation_id=args.set_status_id, status=args.status)
             if args.no_list:
                 return
 
-        payload = get_active_activations(start=args.start, limit=args.limit)
+            payload = get_active_activations(start=args.start, limit=args.limit)
+            records = validate_records_payload(payload)
     except (RuntimeError, ValueError) as error:
         print(f"[错误] {error}")
         sys.exit(1)
@@ -254,11 +299,6 @@ def main():
 
     if isinstance(payload, dict) and payload.get("status") not in (None, "success"):
         print(f"[接口状态] {payload.get('status')}")
-
-    records = extract_records(payload)
-    if not records and not (isinstance(payload, dict) and isinstance(payload.get("data"), list)):
-        print(f"[异常响应] {payload}")
-        sys.exit(1)
 
     print_active_activations(records)
 

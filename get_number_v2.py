@@ -243,11 +243,28 @@ def print_candidate_build_diagnostics(
         f"其中 {countries_with_operators} 条需要继续展开运营商价格。"
     )
 
-def request_number(params: dict) -> dict:
-    response = perform_request(params)
-    response.raise_for_status()
-    return response.json()
+def parse_response_payload(response: requests.Response):
+    try:
+        return response.json()
+    except ValueError:
+        return response.text.strip()
 
+
+def print_response_payload(payload) -> None:
+    print("[返回响应]")
+    if isinstance(payload, (dict, list)):
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(payload)
+
+
+def request_number(params: dict):
+    response = perform_request(params)
+    payload = parse_response_payload(response)
+    print(f"[HTTP状态] {response.status_code}")
+    print_response_payload(payload)
+    response.raise_for_status()
+    return payload
 
 def main():
     configure_stdout()
@@ -300,6 +317,8 @@ def main():
         return
 
     remaining_candidates = candidates[:]
+    before_balance_value = None
+    should_print_preflight = True
     while remaining_candidates:
         if candidate and any(
             item["service"] == candidate["service"]
@@ -311,12 +330,13 @@ def main():
         else:
             current_candidate = pick_random_candidate_with_rng(remaining_candidates, rng)
         request_params = build_request_params(current_candidate)
-
+        # TODO: 后续加入 404 operator 黑名单，避免重复命中已知无效服务商。
+        if should_print_preflight:
+            print_active_activations_snapshot("before getNumberV2", limit=5)
+            _, before_balance_value = print_balance("before")
+            should_print_preflight = False
         print("[发送请求]")
         print(json.dumps(request_params, ensure_ascii=False, indent=2))
-        # TODO: 后续加入 404 operator 黑名单，避免重复命中已知无效服务商。
-        print_active_activations_snapshot("before getNumberV2", limit=5)
-        _, before_balance_value = print_balance("before")
 
         try:
             response = request_number(request_params)
@@ -327,52 +347,32 @@ def main():
                 interval_seconds=2,
             )
             print_active_activations_snapshot("after getNumberV2", limit=5)
-            print("[接口响应]")
-            print(json.dumps(response, ensure_ascii=False, indent=2))
             return
         except RuntimeError as error:
             print(f"[错误] {error}")
             sys.exit(1)
         except requests.HTTPError as error:
-            print_balance_series(
-                before_balance_value=before_balance_value,
-                max_price=max_price,
-                times=5,
-                interval_seconds=2,
-            )
-            print_active_activations_snapshot("after getNumberV2", limit=5)
             status_code = error.response.status_code if error.response is not None else "unknown"
-            if status_code == 404:
-                print(
-                    f"[err] operator={current_candidate['operator'] or '-'} "
-                    f"country={current_candidate['country']} "
-                    f"service={current_candidate['service']} status=404"
+            print(
+                f"[err] operator={current_candidate['operator'] or '-'} "
+                f"country={current_candidate['country']} "
+                f"service={current_candidate['service']} status={status_code}"
+            )
+            remaining_candidates = [
+                item for item in remaining_candidates
+                if not (
+                    item["service"] == current_candidate["service"]
+                    and item["country"] == current_candidate["country"]
+                    and item["operator"] == current_candidate["operator"]
                 )
-                remaining_candidates = [
-                    item for item in remaining_candidates
-                    if not (
-                        item["service"] == current_candidate["service"]
-                        and item["country"] == current_candidate["country"]
-                        and item["operator"] == current_candidate["operator"]
-                    )
-                ]
-                candidate = None
-                if remaining_candidates:
-                    print(f"[重试] 剩余候选数: {len(remaining_candidates)}，重新随机抽取")
-                    continue
-                print("[结果] 所有候选都已尝试，但都返回 404")
-                sys.exit(1)
-            print_active_activations_snapshot("after getNumberV2", limit=5)
-            print(f"[请求失败] {error}")
+            ]
+            candidate = None
+            if remaining_candidates:
+                print(f"[重试] 剩余候选数: {len(remaining_candidates)}，重新随机抽取")
+                continue
+            print(f"[结果] 所有候选都已尝试，但都返回非 200 响应；最后状态码={status_code}")
             sys.exit(1)
         except requests.RequestException as error:
-            print_balance_series(
-                before_balance_value=before_balance_value,
-                max_price=max_price,
-                times=5,
-                interval_seconds=2,
-            )
-            print_active_activations_snapshot("after getNumberV2", limit=5)
             print(f"[请求失败] {error}")
             sys.exit(1)
 
