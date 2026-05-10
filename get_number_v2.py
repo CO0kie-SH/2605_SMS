@@ -8,8 +8,9 @@ import time
 import requests
 from dotenv import load_dotenv
 
+from get_active_activations import get_active_activations, extract_records, print_active_activations
 from get_prices import build_get_number_v2_candidates, resolve_max_price
-from get_service_coverage import BASE_URL, configure_stdout
+from get_service_coverage import BASE_URL, configure_stdout, build_coverage
 
 load_dotenv()
 
@@ -134,11 +135,113 @@ def print_balance_series(
             )
             print(f"[余额变化] diff={diff}{compare_text}")
             detected_drop = True
+            break
         if index < times - 1:
             time.sleep(interval_seconds)
     if not detected_drop:
         print("[余额变化] 在这 5 次轮询内，未检测到余额低于请求前余额")
 
+
+def print_active_activations_snapshot(label: str, limit: int = 5) -> None:
+    print(f"[活动激活快照] {label}")
+    try:
+        payload = get_active_activations(start=0, limit=limit)
+    except SystemExit:
+        raise
+    except Exception as error:
+        print(f"[活动激活快照] 查询失败: {error}")
+        return
+
+    records = extract_records(payload)
+    if not records and not (isinstance(payload, dict) and isinstance(payload.get("data"), list)):
+        print(f"[活动激活快照] 异常响应: {payload}")
+        return
+    print_active_activations(records)
+
+
+def format_filter_reasons(row: dict, max_price: float | None, in_stock_only: bool, visible_only: bool) -> list[str]:
+    reasons = []
+    if in_stock_only and (row["count"] or 0) <= 0:
+        reasons.append(f"no_stock(count={row['count']})")
+    if visible_only and not row["visible"]:
+        reasons.append("not_visible")
+    if max_price is not None and row["price"] > max_price:
+        reasons.append(f"over_max_price(price={row['price']:.4f})")
+    return reasons
+
+
+def print_candidate_build_diagnostics(
+    service: str,
+    max_price: float | None,
+    in_stock_only: bool,
+    visible_only: bool,
+    preview_limit: int = 10,
+) -> None:
+    print("[抽取过程]")
+    print(
+        f"service={service} "
+        f"maxPrice={max_price if max_price is not None else '-'} "
+        f"in_stock_only={in_stock_only} "
+        f"visible_only={visible_only}"
+    )
+
+    try:
+        rows = build_coverage(service)
+    except Exception as error:
+        print(f"[抽取过程] 查询国家价格失败: {error}")
+        return
+
+    print(f"[阶段] 原始国家价格数量: {len(rows)}")
+    stage_rows = rows
+
+    if in_stock_only:
+        stage_rows = [row for row in stage_rows if (row["count"] or 0) > 0]
+        print(f"[阶段] 库存过滤 count>0 后: {len(stage_rows)}")
+    else:
+        print("[阶段] 未启用库存过滤")
+
+    if visible_only:
+        stage_rows = [row for row in stage_rows if row["visible"]]
+        print(f"[阶段] 可见过滤 visible=1 后: {len(stage_rows)}")
+    else:
+        print("[阶段] 未启用 visible 过滤")
+
+    if max_price is not None:
+        stage_rows = [row for row in stage_rows if row["price"] <= max_price]
+        print(f"[阶段] 最高价过滤 price<=maxPrice 后: {len(stage_rows)}")
+    else:
+        print("[阶段] 未启用最高价过滤")
+
+    sorted_rows = sorted(rows, key=lambda row: (row["price"], -(row["count"] or 0), row["id"]))
+    shown_rows = sorted_rows[:preview_limit]
+    if shown_rows:
+        print(f"[最低价国家预览] 前 {len(shown_rows)} 条")
+        for index, row in enumerate(shown_rows, start=1):
+            name = row["name_cn"] or row["name_en"] or f"Country {row['id']}"
+            reasons = format_filter_reasons(row, max_price, in_stock_only, visible_only)
+            status = "pass_country_filter" if not reasons else "filtered: " + ", ".join(reasons)
+            print(
+                f"  {index}. id={row['id']} name={name} "
+                f"price={row['price']:.4f} "
+                f"count={row['count'] if row['count'] is not None else '-'} "
+                f"physical={row['physical_count'] if row['physical_count'] is not None else '-'} "
+                f"operators={len(row['operators'])} "
+                f"visible={'yes' if row['visible'] else 'no'} -> {status}"
+            )
+    else:
+        print("[最低价国家预览] 无国家价格数据")
+
+    if not stage_rows:
+        print("[诊断] 国家层过滤后为空，尚未进入运营商抽取。")
+        if in_stock_only:
+            print("[提示] 默认只抽 count>0；需要观察无库存数据时，可加 --include-no-stock。")
+        return
+
+    countries_with_operators = sum(1 for row in stage_rows if row["operators"])
+    print(
+        f"[诊断] 国家层仍有 {len(stage_rows)} 条，"
+        f"其中 {countries_with_operators} 条需要继续展开运营商价格。"
+    )
 
 def request_number(params: dict) -> dict:
     response = perform_request(params)
@@ -164,6 +267,12 @@ def main():
     )
     if not candidates:
         print("[结果] 当前过滤条件下没有可用候选")
+        print_candidate_build_diagnostics(
+            service=args.service,
+            max_price=max_price,
+            in_stock_only=not args.include_no_stock,
+            visible_only=args.visible_only,
+        )
         sys.exit(1)
 
     rng = random.Random(args.seed)
@@ -206,6 +315,7 @@ def main():
         print("[发送请求]")
         print(json.dumps(request_params, ensure_ascii=False, indent=2))
         # TODO: 后续加入 404 operator 黑名单，避免重复命中已知无效服务商。
+        print_active_activations_snapshot("before getNumberV2", limit=5)
         _, before_balance_value = print_balance("before")
 
         try:
@@ -216,6 +326,7 @@ def main():
                 times=5,
                 interval_seconds=2,
             )
+            print_active_activations_snapshot("after getNumberV2", limit=5)
             print("[接口响应]")
             print(json.dumps(response, ensure_ascii=False, indent=2))
             return
@@ -229,6 +340,7 @@ def main():
                 times=5,
                 interval_seconds=2,
             )
+            print_active_activations_snapshot("after getNumberV2", limit=5)
             status_code = error.response.status_code if error.response is not None else "unknown"
             if status_code == 404:
                 print(
@@ -250,6 +362,7 @@ def main():
                     continue
                 print("[结果] 所有候选都已尝试，但都返回 404")
                 sys.exit(1)
+            print_active_activations_snapshot("after getNumberV2", limit=5)
             print(f"[请求失败] {error}")
             sys.exit(1)
         except requests.RequestException as error:
@@ -259,9 +372,12 @@ def main():
                 times=5,
                 interval_seconds=2,
             )
+            print_active_activations_snapshot("after getNumberV2", limit=5)
             print(f"[请求失败] {error}")
             sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
+
