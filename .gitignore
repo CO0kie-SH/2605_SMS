@@ -1,0 +1,12 @@
+# Local secrets
+.env
+
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+log/
