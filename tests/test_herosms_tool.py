@@ -8,7 +8,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from herosms_tool import HeroSMSWorkflow, UserInputExit, UserInputState, WorkflowConfig, parse_args, parse_balance_value
+from herosms_tool import (
+    HeroSMSWorkflow,
+    NumberRequestResult,
+    UserInputExit,
+    UserInputState,
+    WorkflowConfig,
+    parse_args,
+    parse_balance_value,
+)
 
 
 def test_parse_args_cli_values_override_environment_defaults():
@@ -259,6 +267,27 @@ def test_user_input_six_enters_finish_mode_and_targets_first_record():
     assert state.mode is None
 
 
+def test_user_input_three_enters_resend_mode_and_targets_first_record():
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    records = [{"activationId": "first"}]
+    refreshed_records = [{"activationId": "after"}]
+    requested = []
+    printed = []
+    workflow.get_active_records = lambda limit=100: records
+    workflow.print_active_records = lambda input_records: printed.append(input_records)
+    workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
+
+    state = workflow.handle_user_input("3", UserInputState())
+    assert state.mode == 3
+    assert state.records == records
+
+    workflow.get_active_records = lambda limit=100: refreshed_records
+    state = workflow.handle_user_input("3-1", state)
+    assert requested == [("first", 3)]
+    assert printed[-1] == refreshed_records
+    assert state.mode is None
+
+
 def test_user_input_eight_enters_refund_mode_and_targets_first_record():
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
     records = [{"activationId": "first"}]
@@ -278,6 +307,91 @@ def test_user_input_eight_enters_refund_mode_and_targets_first_record():
     assert requested == [("first", 8)]
     assert printed[-1] == refreshed_records
     assert state.mode is None
+
+
+def test_user_input_nine_refunds_empty_list_then_requests_replacement():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", max_price=0.5, send=True),
+        logger=logging.getLogger("test"),
+    )
+    original_records = [
+        {"activationId": "first", "serviceCode": "dr", "countryCode": "16"},
+    ]
+    requested_statuses = []
+    requested_numbers = []
+    printed = []
+    polled = {"active": False}
+    active_after_new_number = [{"activationId": "new", "phoneNumber": "5550009"}]
+    active_responses = [original_records, [], active_after_new_number]
+
+    workflow.get_active_records = lambda limit=100: active_responses.pop(0)
+    workflow.print_active_records = lambda input_records: printed.append(input_records)
+    workflow.set_activation_status = lambda activation_id, status: requested_statuses.append((activation_id, status))
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+    workflow.build_replacement_merchant_from_record = lambda record: {"service": "dr", "country": 16, "operator": "", "price": 0.1, "count": 1}
+    workflow.obtain_number_with_retry = lambda provider=None: requested_numbers.append(provider()[0]) or NumberRequestResult(
+        payload={"phoneNumber": "5550009"},
+        phone="5550009",
+    )
+    workflow.poll_balance_change = lambda before_balance: None
+    workflow.poll_active_list = lambda: polled.__setitem__("active", True)
+
+    state = workflow.handle_user_input("9-1", UserInputState())
+
+    assert requested_statuses == [("first", 8)]
+    assert requested_numbers == [{"service": "dr", "country": 16, "operator": "", "price": 0.1, "count": 1}]
+    assert printed[0] == original_records
+    assert printed[1] == []
+    assert polled["active"]
+    assert state.records == active_after_new_number
+
+
+def test_user_input_nine_completes_record_with_sms_payload():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", max_price=0.5, send=True),
+        logger=logging.getLogger("test"),
+    )
+    original_records = [
+        {"activationId": "first", "serviceCode": "dr", "countryCode": "16", "smsCode": "123456"},
+    ]
+    requested_statuses = []
+    active_responses = [original_records, [], [{"activationId": "new", "phoneNumber": "5550010"}]]
+    polled = {"active": False}
+
+    workflow.get_active_records = lambda limit=100: active_responses.pop(0)
+    workflow.print_active_records = lambda input_records: None
+    workflow.set_activation_status = lambda activation_id, status: requested_statuses.append((activation_id, status))
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+    workflow.build_replacement_merchant_from_record = lambda record: {"service": "dr", "country": 16, "operator": "", "price": 0.1, "count": 1}
+    workflow.obtain_number_with_retry = lambda provider=None: NumberRequestResult(
+        payload={"phoneNumber": "5550010"},
+        phone="5550010",
+    )
+    workflow.poll_balance_change = lambda before_balance: None
+    workflow.poll_active_list = lambda: polled.__setitem__("active", True)
+
+    workflow.handle_user_input("9-1", UserInputState())
+
+    assert requested_statuses == [("first", 6)]
+    assert polled["active"]
+
+
+def test_user_input_nine_stops_when_active_list_is_not_empty_after_status():
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    original_records = [{"activationId": "first", "serviceCode": "dr", "countryCode": "16"}]
+    still_active = [{"activationId": "other"}]
+    active_responses = [original_records, still_active]
+    requested_numbers = []
+
+    workflow.get_active_records = lambda limit=100: active_responses.pop(0)
+    workflow.print_active_records = lambda input_records: None
+    workflow.set_activation_status = lambda activation_id, status: None
+    workflow.obtain_number_with_retry = lambda provider=None: requested_numbers.append(True)
+
+    state = workflow.handle_user_input("9-1", UserInputState())
+
+    assert requested_numbers == []
+    assert state.records == still_active
 
 
 def test_user_input_eight_refuses_record_with_sms_payload():
