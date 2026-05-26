@@ -16,6 +16,7 @@ from herosms_tool import (
     WorkflowConfig,
     parse_args,
     parse_balance_value,
+    parse_float_levels,
 )
 
 
@@ -58,6 +59,19 @@ def test_parse_args_uses_environment_when_cli_omits_values():
     assert config.api_key == "env-key"
     assert config.base_url == "https://env.test/api"
     assert config.max_price == 0.03
+
+
+def test_parse_args_supports_max_price_levels():
+    args = parse_args(["run", "--max-price", "0.025-0.03-0.035"])
+
+    config = WorkflowConfig.from_args(args, env={})
+
+    assert config.max_price_levels == (0.025, 0.03, 0.035)
+    assert config.max_price == 0.035
+
+
+def test_parse_float_levels_ignores_empty_parts():
+    assert parse_float_levels("0.025--0.03") == (0.025, 0.03)
 
 
 @pytest.mark.parametrize(
@@ -144,11 +158,12 @@ def test_run_retries_non_200_and_continues_until_success():
     assert calls == ["bad", "ok"]
 
 
-def test_run_accumulates_retry_count_when_no_merchants_then_exits():
+def test_run_accumulates_retry_count_when_no_merchants_then_exits(monkeypatch):
     workflow = HeroSMSWorkflow(
         WorkflowConfig(api_key="k", max_price=0.5, send=True, retry_limit=2),
         logger=logging.getLogger("test"),
     )
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
     workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
     workflow.get_active_records = lambda limit=100: []
     build_calls = {"count": 0}
@@ -223,6 +238,79 @@ def test_run_resets_retry_count_after_number_success():
 
     assert workflow.run() == 0
     assert calls == ["bad", "ok"]
+
+
+def test_run_logs_affordable_count_from_balance_and_max_price():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", max_price=0.25),
+        logger=logging.getLogger("test"),
+    )
+    messages = []
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.10"
+    workflow.get_active_records = lambda limit=100: []
+    workflow.obtain_number_with_retry = lambda: NumberRequestResult(dry_run=True)
+
+    assert workflow.run() == 0
+    assert any("[可购买次数估算] 当前余额=1.1 maxPrice=0.25 可支持约 4 次" in message for message in messages)
+
+
+def test_obtain_number_attempts_each_merchant_once_without_fixed_retry_limit():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", send=True, retry_limit=99),
+        logger=logging.getLogger("test"),
+    )
+    merchants = [
+        {"service": "dr", "country": index, "operator": f"op{index}", "price": 0.01, "count": 1}
+        for index in range(3)
+    ]
+    calls = []
+    workflow.request_number = lambda merchant: calls.append(merchant["operator"]) or (500, {"error": "temporary"})
+
+    result = workflow.obtain_number_with_retry(lambda: merchants)
+
+    assert result is None
+    assert calls == ["op0", "op1", "op2"]
+
+
+def test_obtain_number_tries_price_levels_until_success():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", send=True, max_price=0.035, max_price_levels=(0.025, 0.03, 0.035)),
+        logger=logging.getLogger("test"),
+    )
+    built_prices = []
+    calls = []
+
+    def fake_build(max_price):
+        built_prices.append(max_price)
+        if max_price == 0.025:
+            return [
+                {"service": "dr", "country": 1, "operator": "a", "price": 0.025, "count": 1},
+                {"service": "dr", "country": 2, "operator": "b", "price": 0.025, "count": 1},
+            ]
+        if max_price == 0.03:
+            return [
+                {"service": "dr", "country": 3, "operator": "c", "price": 0.03, "count": 1},
+            ]
+        return [
+            {"service": "dr", "country": 4, "operator": "d", "price": 0.035, "count": 1},
+        ]
+
+    def fake_request(merchant):
+        calls.append(merchant["operator"])
+        if merchant["operator"] == "c":
+            return 200, {"phoneNumber": "5550001"}
+        return 500, {"error": "temporary"}
+
+    workflow.build_merchants_for_max_price = fake_build
+    workflow.request_number = fake_request
+
+    result = workflow.obtain_number_with_retry()
+
+    assert result is not None
+    assert result.phone == "5550001"
+    assert built_prices == [0.025, 0.03]
+    assert calls == ["a", "b", "c"]
 
 
 def test_phone_presence_checks_common_fields():
@@ -377,7 +465,7 @@ def test_user_input_nine_completes_record_with_sms_payload():
 
 
 def test_user_input_nine_stops_when_active_list_is_not_empty_after_status():
-    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k", send=True), logger=logging.getLogger("test"))
     original_records = [{"activationId": "first", "serviceCode": "dr", "countryCode": "16"}]
     still_active = [{"activationId": "other"}]
     active_responses = [original_records, still_active]
@@ -443,14 +531,47 @@ def test_user_input_loop_accepts_initial_records_and_exit(monkeypatch):
         logger=logging.getLogger("test"),
     )
     shown = []
+    finalized = {"called": False}
     workflow.print_active_records = lambda records: shown.append(records)
-    monkeypatch.setattr("select.select", lambda *_args, **_kwargs: ([object()], [], []))
-    monkeypatch.setattr("sys.stdin.readline", lambda: "99\n")
+    workflow.read_user_input_with_timeout = lambda timeout: "99"
+    workflow.finalize_after_input_timeout = lambda: finalized.__setitem__("called", True)
 
     with pytest.raises(UserInputExit):
         workflow.user_input_loop(initial_records=[{"activationId": "a1"}])
 
     assert shown == [[{"activationId": "a1"}]]
+    assert not finalized["called"]
+
+
+def test_user_input_loop_auto_refunds_single_record_without_sms_after_timeout():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", input_poll_times=1, input_poll_interval=0),
+        logger=logging.getLogger("test"),
+    )
+    active_records = [[{"activationId": "a1"}], []]
+    requested = []
+    printed = []
+    workflow.read_user_input_with_timeout = lambda timeout: None
+    workflow.get_active_records = lambda limit=100: active_records.pop(0)
+    workflow.print_active_records = lambda records: printed.append(records)
+    workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
+
+    workflow.user_input_loop()
+
+    assert requested == [("a1", 8)]
+    assert printed == [[{"activationId": "a1"}], []]
+
+
+def test_finalize_after_input_timeout_does_not_refund_record_with_sms():
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    requested = []
+    workflow.get_active_records = lambda limit=100: [{"activationId": "a1", "smsCode": "123456"}]
+    workflow.print_active_records = lambda records: None
+    workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
+
+    workflow.finalize_after_input_timeout()
+
+    assert requested == []
 
 
 def test_user_input_99_queries_history_before_exit():

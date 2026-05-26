@@ -61,6 +61,18 @@ def parse_float(value: str | float | None) -> float | None:
     return float(text)
 
 
+def parse_float_levels(value: str | float | None) -> tuple[float, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (int, float)):
+        return (float(value),)
+    text = str(value).strip()
+    if not text:
+        return ()
+    parts = [part.strip() for part in text.split("-") if part.strip()]
+    return tuple(float(part) for part in parts)
+
+
 class UserInputExit(Exception):
     """用户输入 99 时主动退出当前流程。"""
 
@@ -83,6 +95,7 @@ class WorkflowConfig:
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     max_price: float | None = None
+    max_price_levels: tuple[float, ...] = ()
     service: str = "dr"
     merchant_seed: int | None = None
     retry_limit: int = 10
@@ -110,10 +123,12 @@ class WorkflowConfig:
         api_key = args.api_key or env.get("HEROSMS_API_KEY", "")
         base_url = args.base_url or env.get("HEROSMS_BASE_URL", DEFAULT_BASE_URL)
         max_price_raw = args.max_price if args.max_price is not None else env.get("HEROSMS_MAX_PRICE")
+        max_price_levels = parse_float_levels(max_price_raw)
         return cls(
             api_key=api_key,
             base_url=base_url,
-            max_price=parse_float(max_price_raw),
+            max_price=max(max_price_levels) if max_price_levels else None,
+            max_price_levels=max_price_levels,
             service=args.service,
             merchant_seed=args.merchant_seed,
             retry_limit=args.retry_limit,
@@ -164,13 +179,19 @@ class HeroSMSWorkflow:
         return validate_records_payload(payload)
 
     def build_merchants(self) -> list[dict]:
+        return self.build_merchants_for_max_price(self.config.max_price)
+
+    def build_merchants_for_max_price(self, max_price: float | None) -> list[dict]:
         merchants = build_get_number_v2_candidates(
             service=self.config.service,
-            max_price=self.config.max_price,
+            max_price=max_price,
             in_stock_only=not self.config.include_no_stock,
             visible_only=self.config.visible_only,
         )
         return self.sort_merchants(merchants)
+
+    def iter_max_price_levels(self) -> tuple[float | None, ...]:
+        return self.config.max_price_levels or (self.config.max_price,)
 
     @staticmethod
     def sort_merchants(merchants: list[dict]) -> list[dict]:
@@ -591,6 +612,48 @@ class HeroSMSWorkflow:
                     raise
                 except Exception as error:
                     self.log_and_print(f"[用户输入处理失败] {error}", logging.WARNING)
+        self.finalize_after_input_timeout()
+
+    def finalize_after_input_timeout(self) -> None:
+        self.log_and_print("[用户输入轮询结束] 已达到轮询次数，开始自动收尾检查")
+        try:
+            records = self.get_active_records(limit=self.config.active_limit)
+        except Exception as error:
+            self.log_and_print(f"[自动收尾] 查询活动激活列表失败: {error}", logging.WARNING)
+            return
+
+        self.print_active_records(records)
+        if len(records) != 1:
+            self.log_and_print(f"[自动收尾] 当前活动激活数量={len(records)}，不满足自动 8 条件")
+            return
+
+        record = records[0]
+        activation_id = str(record.get("activationId", "")).strip()
+        if not activation_id:
+            self.log_and_print("[自动收尾] 唯一活动记录缺少 activationId，跳过自动 8", logging.WARNING)
+            return
+
+        sms_payload_fields = self.get_sms_payload_fields(record)
+        if sms_payload_fields:
+            fields_text = "/".join(sms_payload_fields)
+            self.log_and_print(
+                f"[自动收尾] activationId={activation_id} 已收到 {fields_text}，不执行自动 8，请手动判断是否完成",
+                logging.WARNING,
+            )
+            return
+
+        self.log_and_print(f"[自动收尾] 仅剩 1 条且未收到验证码，自动执行 status=8 activationId={activation_id}")
+        try:
+            self.set_activation_status(activation_id=activation_id, status=8)
+        except Exception as error:
+            self.log_and_print(f"[自动收尾] 自动 status=8 失败: {error}", logging.WARNING)
+            return
+
+        try:
+            refreshed_records = self.get_active_records(limit=self.config.active_limit)
+            self.print_active_records(refreshed_records)
+        except Exception as error:
+            self.log_and_print(f"[自动收尾] status=8 后刷新活动列表失败: {error}", logging.WARNING)
 
     def read_user_input_with_timeout(self, timeout: int | float) -> str | None:
         if os.name == "nt":
@@ -650,8 +713,28 @@ class HeroSMSWorkflow:
         self,
         merchant_provider: Callable[[], list[dict]] | None = None,
     ) -> NumberRequestResult | None:
+        if merchant_provider is not None:
+            return self.obtain_number_from_provider(merchant_provider)
+
+        levels = self.iter_max_price_levels()
+        if len(levels) <= 1:
+            return self.obtain_number_from_provider(self.build_merchants)
+
+        for index, max_price in enumerate(levels, start=1):
+            self.log_and_print(f"[价格阶梯] #{index}/{len(levels)} maxPrice={max_price}")
+            result = self.obtain_number_from_provider(lambda max_price=max_price: self.build_merchants_for_max_price(max_price))
+            if result is not None:
+                return result
+            if index < len(levels):
+                self.log_and_print(f"[价格阶梯] maxPrice={max_price} 未成功，继续尝试下一档")
+
+        return None
+
+    def obtain_number_from_provider(
+        self,
+        merchant_provider: Callable[[], list[dict]],
+    ) -> NumberRequestResult | None:
         retry_count = 0
-        merchant_provider = merchant_provider or self.build_merchants
 
         while retry_count <= self.config.retry_limit:
             try:
@@ -677,8 +760,11 @@ class HeroSMSWorkflow:
                 time.sleep(5)
                 continue
 
+            request_attempt_limit = len(merchants)
+            request_attempt_count = 0
+            self.log_and_print(f"[号码请求上限] 当前商户候选数量={request_attempt_limit}，本轮最多尝试 {request_attempt_limit} 次")
             remaining_merchants = merchants[:]
-            while remaining_merchants and retry_count <= self.config.retry_limit:
+            while remaining_merchants and request_attempt_count < request_attempt_limit:
                 merchant = self.select_merchant(remaining_merchants)
                 self.log_and_print(
                     "[抽取商户] "
@@ -698,24 +784,23 @@ class HeroSMSWorkflow:
                     status_code, payload = 0, str(error)
 
                 if status_code != 200:
-                    retry_count += 1
+                    request_attempt_count += 1
                     self.log_and_print(f"[非200] status={status_code}")
                     self.log_and_print(f"[返回信息] {payload}")
-                    self.log_and_print(f"[重试计数] {retry_count}/{self.config.retry_limit}")
+                    self.log_and_print(f"[号码请求计数] {request_attempt_count}/{request_attempt_limit}")
                     remaining_merchants = [item for item in remaining_merchants if item is not merchant]
-                    if retry_count > self.config.retry_limit:
-                        self.log_and_print("[失败] 获取号码阶段超过重试次数，退出", logging.ERROR)
-                        return None
                     if remaining_merchants:
                         self.log_and_print(f"[重试] 剩余商户数量 {len(remaining_merchants)}")
                         continue
-                    self.log_and_print("[重试] 当前商户列表已耗尽，重新获取商户列表")
-                    break
+                    self.log_and_print("[失败] 当前商户列表已耗尽，停止本轮号码请求")
+                    return None
 
                 self.log_and_print("[成功] HTTP 200，返回信息：")
                 print_response_payload(payload)
                 self.logger.info("number_response=%s", json.dumps(payload, ensure_ascii=False, default=str))
                 return NumberRequestResult(payload=payload, phone=self.extract_phone_number(payload))
+
+            return None
 
         return None
 
@@ -732,6 +817,12 @@ class HeroSMSWorkflow:
         if before_balance is None:
             self.log_and_print("[错误] 余额响应无法解析，退出", logging.ERROR)
             return 1
+        if self.config.max_price is not None:
+            affordable_count = int(before_balance // self.config.max_price) if self.config.max_price > 0 else 0
+            self.log_and_print(
+                f"[可购买次数估算] 当前余额={before_balance} maxPrice={self.config.max_price} "
+                f"可支持约 {affordable_count} 次"
+            )
         if self.config.max_price is not None and before_balance < self.config.max_price:
             self.log_and_print(
                 f"[余额不足] 当前余额={before_balance}，设置价格={self.config.max_price}，退出",
@@ -816,7 +907,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default=None, help="HeroSMS API Key；优先级高于 HEROSMS_API_KEY")
     parser.add_argument("--base-url", default=None, help="API 地址；优先级高于 HEROSMS_BASE_URL")
     parser.add_argument("-s", "--service", default="dr", help="服务代码，默认 dr")
-    parser.add_argument("--max-price", default=None, help="最高价格；优先级高于 HEROSMS_MAX_PRICE")
+    parser.add_argument(
+        "--max-price",
+        default=None,
+        help="最高价格；支持 0.025-0.03-0.035 多级价格；优先级高于 HEROSMS_MAX_PRICE",
+    )
     parser.add_argument("--merchant-seed", type=int, default=None, help="商户抽取随机种子")
     parser.add_argument("--retry-limit", type=int, default=10, help="获取商户/号码累计重试次数上限，超过后退出，默认 10")
     parser.add_argument("--send", action="store_true", help="真实发送号码请求；默认 dry-run")

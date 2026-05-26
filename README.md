@@ -1,7 +1,7 @@
 # HeroSMS Python 调试工具集
 
-> 当前版本：`26.5.23A`  
-> 最后更新：`2026-05-23`  
+> 当前版本：`26.5.26A`  
+> 最后更新：`2026-05-26`  
 > 项目定位：合法合规地调试 HeroSMS / SMS-Activate 风格 API，重点用于观察余额、价格、库存、号码请求、活动激活状态、状态变更与完整工作流。
 
 ---
@@ -19,6 +19,7 @@
 - 请求前后观察余额变化
 - 请求前后观察活动激活列表
 - 验证成功号码是否真实进入活动激活列表
+- 支持按 `0.025-0.03-0.035` 这类多级价格逐档查询和申请号码
 - 支持交互式将激活状态改为 `3`（请求重发短信）、`6`（完成）或 `8`（退款）
 - 支持本地组合 `9` 模式：处理旧激活、确认列表清空、按原服务/国家/商家校验价格并重新申请号码
 - 支持查询历史记录与记录日志
@@ -33,6 +34,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| `26.5.26A` | 2026-05-26 | 新增多级价格阶梯，`--max-price` / `HEROSMS_MAX_PRICE` 支持 `0.025-0.03-0.035` 格式并按档位逐级查询商户和申请号码；号码申请次数改为按当前商户候选数量自适应；余额查询阶段输出按最高价格估算的可购买次数；`service=dr` 候选生成加入 `country=4` 黑名单；用户输入轮询自然结束后新增自动收尾检查，唯一未收到验证码的活动记录会自动执行 `status=8`；同步 `.env.example`、README 与测试 |
 | `26.5.23A` | 2026-05-23 | 修复 Windows 下 `select.select(sys.stdin)` 导致的 `WinError 10038`；新增 `3/3-序号` 请求重发短信模式；新增本地组合 `9/9-序号` 处理后重开模式，并在成功申请新号后进入活动列表 25 次轮询；抽取号码申请重试循环供主流程和 9 模式复用；用户输入轮询默认次数从 100 调整为 50；补充 README 与单元测试覆盖 |
 | `26.5.18A` | 2026-05-18 | 新增 `herosms_tool.py` 统一工作流入口、测试目录与日志目录；成功号码展示统一补 `+` 前缀；无商户候选时增加 5 秒等待后重试；补全文档中的全部参数说明 |
 | `26.5.16A` | 2026-05-16 | 整合分散 API 脚本为类式统一入口，使用 `WorkflowConfig + HeroSMSWorkflow + UserInputState` 完成完整流程编排；打通余额、活动激活列表、商户候选、号码请求、状态变更、用户输入轮询与历史记录查询 |
@@ -71,14 +73,14 @@ pip install pytest
 ```env
 HEROSMS_API_KEY=你的API密钥
 HEROSMS_BASE_URL=https://hero-sms.com/stubs/handler_api.php
-HEROSMS_MAX_PRICE=0.025
+HEROSMS_MAX_PRICE=0.025-0.03-0.035
 ```
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `HEROSMS_API_KEY` | 是 | HeroSMS API 密钥 |
 | `HEROSMS_BASE_URL` | 否 | API 地址，默认 `https://hero-sms.com/stubs/handler_api.php` |
-| `HEROSMS_MAX_PRICE` | 否 | 最高价格限制，供 `get_prices.py`、`get_number_v2.py`、`herosms_tool.py` 使用 |
+| `HEROSMS_MAX_PRICE` | 否 | 最高价格限制；`herosms_tool.py` 支持 `0.025-0.03-0.035` 多级价格 |
 
 优先级说明：
 
@@ -142,17 +144,18 @@ HEROSMS_MAX_PRICE=0.025
 - 默认是单线程保护模式，活动列表非空时会阻止继续请求新号码
 - `status=8` 退款时，如果记录中已有 `smsCode` 或 `smsText`，会拒绝退款
 
-### 今日任务梳理（26.5.23A）
+### 今日任务梳理（26.5.26A）
 
-本版本围绕活动激活处理和交互流程做了以下更新：
+本版本围绕价格控制、候选过滤、轮询结束收尾和测试覆盖做了以下更新：
 
-1. 修复 Windows 终端输入轮询：Windows 使用 `msvcrt`，其他平台继续使用 `select.select()`，避免 `WinError 10038`。
-2. 新增 `3` / `3-序号` 模式：通过 `setStatus(status=3)` 请求重新发送短信。
-3. 新增本地组合 `9` / `9-序号` 模式：先按目标记录是否已有短信执行 `status=6/8`，再确认活动列表清空、校验原服务/国家/商家价格，符合限额后重新申请号码。
-4. `9-序号` 成功申请新号码并确认进入活动列表后，会直接进入活动列表轮询，默认执行 `25` 次，而不是立即回到用户输入轮询。
-5. 将号码申请重试循环抽成 `obtain_number_with_retry()`，供普通 `run()` 主流程和 `9` 模式共用。
-6. 用户输入轮询默认次数从 `100` 调整为 `50`。
-7. 补充 `tests/test_herosms_tool.py` 中 `3` 模式、`9` 模式和 9 模式后续活动列表轮询的测试覆盖。
+1. 新增多级价格阶梯：`--max-price` 与 `HEROSMS_MAX_PRICE` 都支持 `0.025-0.03-0.035` 格式。
+2. 多级价格执行时会按顺序重新查询商户列表；每个价格档只尝试该档返回的商户数量，成功后立即停止，不再进入后续价格档。
+3. 单价格模式下，号码申请次数也改为按当前商户候选数量自适应，每个商户最多尝试一次。
+4. 余额查询阶段新增 `[可购买次数估算]` 输出，按当前余额除以最高价格取整，估算还能支持多少次号码申请。
+5. 候选生成新增服务国家黑名单：当前 `service=dr` 会过滤 `country=4`。
+6. 用户输入轮询自然跑满默认 `50` 次后会执行自动收尾检查：如果活动列表恰好 1 条且没有 `smsCode` / `smsText`，自动执行 `status=8`，然后继续后续历史查询。
+7. `.env.example` 和 README 的 `HEROSMS_MAX_PRICE` 示例同步为多级价格格式。
+8. 补充多级价格、自适应商户尝试、余额次数估算、`dr` 国家黑名单和自动收尾相关测试。
 
 ### 类设计说明（26.5.16A 整体流程版）
 
@@ -163,6 +166,7 @@ HEROSMS_MAX_PRICE=0.025
 1. **辅助函数层**
    - `parse_balance_value()`：解析 `ACCESS_BALANCE:` 文本余额
    - `parse_float()`：统一解析命令行 / 环境变量中的浮点配置
+   - `parse_float_levels()`：解析 `0.025-0.03-0.035` 这类多级价格配置
 
 2. **状态与配置层**
    - `WorkflowConfig`：统一承载全部运行参数，负责把命令行参数和环境变量合并成不可变配置对象
@@ -182,10 +186,11 @@ HEROSMS_MAX_PRICE=0.025
 
 - **号码获取相关**
   - `build_merchants()`：基于已有价格脚本生成候选
+  - `build_merchants_for_max_price()`：按指定价格档重新生成候选
   - `sort_merchants()`：按价格、库存、国家、运营商排序
   - `select_merchant()`：支持默认最低价优先，或通过 `merchant_seed` 固定抽样
   - `request_number()`：统一执行 `getNumberV2` 请求
-  - `obtain_number_with_retry()`：统一执行商户候选获取、号码请求、非 200 换候选重试和 dry-run 输出
+  - `obtain_number_with_retry()`：统一执行多级价格、商户候选获取、号码请求、非 200 换候选重试和 dry-run 输出
 
 - **成功校验与轮询**
   - `poll_balance_change()`：请求成功后轮询余额变化
@@ -202,6 +207,7 @@ HEROSMS_MAX_PRICE=0.025
   - `handle_user_input()`：处理 `0`、`3`、`6`、`8`、`9`、`3-1`、`6-1`、`8-1`、`9-1`、`99`
   - `handle_mode_9_by_index()`：执行本地组合 9 模式，处理旧激活、校验活动列表、价格和库存，并复用号码申请重试循环
   - `user_input_loop()`：做轮询式交互输入，Windows 下使用 `msvcrt`，其他平台使用 `select.select()`
+  - `finalize_after_input_timeout()`：用户输入轮询结束后自动检查唯一未收到短信的活动记录并执行 `status=8`
   - `print_history()`：统一查询历史记录
 
 - **总流程入口**
@@ -229,7 +235,7 @@ python3 herosms_tool.py run [参数...]
 | `--api-key` | `None` | HeroSMS API Key，优先级高于 `HEROSMS_API_KEY` |
 | `--base-url` | `None` | API 地址，优先级高于 `HEROSMS_BASE_URL` |
 | `-s`, `--service` | `dr` | 服务代码 |
-| `--max-price` | `None` | 最高价格，优先级高于 `HEROSMS_MAX_PRICE` |
+| `--max-price` | `None` | 最高价格，优先级高于 `HEROSMS_MAX_PRICE`；支持 `0.025-0.03-0.035` 多级价格 |
 | `--merchant-seed` | `None` | 商户抽取随机种子，用于复现抽样 |
 | `--retry-limit` | `10` | 获取商户 / 号码累计重试次数上限 |
 | `--send` | 关闭 | 真实发送号码请求；默认 dry-run |
@@ -272,6 +278,14 @@ python3 herosms_tool.py run --service dr --merchant-seed 7 --send
 python3 herosms_tool.py run --service dr --visible-only --max-price 0.025 --send
 ```
 
+多级价格逐级试探：
+
+```bash
+python3 herosms_tool.py run --service dr --max-price 0.025-0.03-0.035 --send
+```
+
+多级价格会按顺序重新查询商户列表并逐个申请号码。例如 `0.025-0.03-0.035` 会先用 `0.025` 查询并尝试该档全部商户；该档全部失败后，再用 `0.03` 查询并尝试；仍失败才进入 `0.035`。任一档成功后立即停止，不再尝试后续价格。
+
 ### 用户输入模式说明
 
 在 `herosms_tool.py` 的交互阶段可输入：
@@ -299,6 +313,15 @@ python3 herosms_tool.py run --service dr --visible-only --max-price 0.025 --send
 4. 价格符合限额时，复用普通号码申请的重试循环继续申请号码。
 
 ### 近期行为变更
+
+#### 26.5.26A
+
+- `--max-price` 与 `HEROSMS_MAX_PRICE` 支持多级价格，例如 `0.025-0.03-0.035`，会逐档查询商户并逐个申请。
+- 号码请求阶段按当前商户候选数量自适应尝试次数，不再用固定 10 次覆盖所有候选。
+- 余额查询后输出 `[可购买次数估算]`，按当前余额除以最高价格取整。
+- `service=dr` 的候选列表会过滤 `country=4`。
+- 用户输入轮询自然结束后会自动查询活动列表；若仅剩 1 条且未收到验证码，会自动执行 `status=8` 后继续历史查询。
+- `.env.example` 的 `HEROSMS_MAX_PRICE` 示例更新为多级价格格式。
 
 #### 26.5.23A
 
@@ -527,10 +550,10 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 & D:\0Code2\py312\python.exe -m pytest -q
 ```
 
-本次文档更新前已确认（2026-05-23）：
+本次文档更新前已确认（2026-05-26）：
 
-- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py tests\test_herosms_tool.py` 通过
-- 当前 `D:\0Code2\py312\python.exe` 环境未安装 `pytest`，因此 `pytest` 未执行
+- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_prices.py tests\test_herosms_tool.py tests\test_get_prices.py` 通过
+- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `36 passed in 2.66s`
 
 ---
 
@@ -538,14 +561,16 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 
 本次会话主要变更集中在：
 
-- `README.md`：更新版本号、流程说明、用户输入模式、9 模式规则与验证记录
-- `herosms_tool.py`：新增 Windows 输入兼容、3 模式、9 模式、号码申请复用流程，并将用户输入轮询默认次数调为 50
-- `tests/test_herosms_tool.py`：补充 3 模式与 9 模式测试覆盖
+- `.env.example`：将 `HEROSMS_MAX_PRICE` 示例同步为多级价格格式
+- `README.md`：更新版本号、版本日志、多级价格、自动收尾、黑名单和验证记录
+- `get_prices.py`：新增 `service=dr` 的 `country=4` 黑名单
+- `herosms_tool.py`：新增多级价格阶梯、自适应商户尝试、余额次数估算和用户输入轮询结束自动收尾
+- `tests/test_herosms_tool.py`、`tests/test_get_prices.py`：补充多级价格、自适应重试、余额估算、黑名单和自动收尾测试覆盖
 
 如需后续做版本提交，建议先：
 
 ```bash
-git add README.md herosms_tool.py tests/
+git add .env.example README.md get_prices.py herosms_tool.py tests/
 ```
 
 再继续检查 staged diff。

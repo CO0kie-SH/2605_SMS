@@ -5,6 +5,14 @@ import sys
 from get_service_coverage import build_coverage, configure_stdout
 from get_operator_prices import load_operator_prices
 
+SERVICE_COUNTRY_BLACKLIST = {
+    "dr": {4},
+}
+
+
+def is_country_blacklisted(service: str, country_id: int) -> bool:
+    return int(country_id) in SERVICE_COUNTRY_BLACKLIST.get(str(service).strip(), set())
+
 
 def parse_max_price(value: str | None) -> float | None:
     if value is None:
@@ -31,6 +39,7 @@ def build_get_number_v2_candidates(
     visible_only: bool = False,
 ) -> list[dict]:
     rows = build_coverage(service)
+    rows = [row for row in rows if not is_country_blacklisted(service, row["id"])]
     if in_stock_only:
         rows = [row for row in rows if (row["count"] or 0) > 0]
     if visible_only:
