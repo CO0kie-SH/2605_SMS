@@ -313,6 +313,32 @@ def test_obtain_number_tries_price_levels_until_success():
     assert calls == ["a", "b", "c"]
 
 
+def test_obtain_number_treats_http_200_without_phone_as_failure():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", send=True),
+        logger=logging.getLogger("test"),
+    )
+    merchants = [
+        {"service": "dr", "country": 16, "operator": "airtel", "price": 0.03, "count": 1},
+        {"service": "dr", "country": 16, "operator": "vodafone", "price": 0.03, "count": 1},
+    ]
+    calls = []
+
+    def fake_request(merchant):
+        calls.append(merchant["operator"])
+        if merchant["operator"] == "airtel":
+            return 200, "NO_NUMBERS"
+        return 200, {"phoneNumber": "5550002"}
+
+    workflow.request_number = fake_request
+
+    result = workflow.obtain_number_with_retry(lambda: merchants)
+
+    assert result is not None
+    assert result.phone == "5550002"
+    assert calls == ["airtel", "vodafone"]
+
+
 def test_phone_presence_checks_common_fields():
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
 

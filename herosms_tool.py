@@ -795,10 +795,24 @@ class HeroSMSWorkflow:
                     self.log_and_print("[失败] 当前商户列表已耗尽，停止本轮号码请求")
                     return None
 
+                phone_number = self.extract_phone_number(payload)
+                if not phone_number:
+                    request_attempt_count += 1
+                    self.log_and_print("[业务失败] HTTP 200 但未获得号码，返回信息：", logging.WARNING)
+                    print_response_payload(payload)
+                    self.logger.warning("number_response_without_phone=%s", json.dumps(payload, ensure_ascii=False, default=str))
+                    self.log_and_print(f"[号码请求计数] {request_attempt_count}/{request_attempt_limit}")
+                    remaining_merchants = [item for item in remaining_merchants if item is not merchant]
+                    if remaining_merchants:
+                        self.log_and_print(f"[重试] 剩余商户数量 {len(remaining_merchants)}")
+                        continue
+                    self.log_and_print("[失败] 当前商户列表已耗尽，停止本轮号码请求")
+                    return None
+
                 self.log_and_print("[成功] HTTP 200，返回信息：")
                 print_response_payload(payload)
                 self.logger.info("number_response=%s", json.dumps(payload, ensure_ascii=False, default=str))
-                return NumberRequestResult(payload=payload, phone=self.extract_phone_number(payload))
+                return NumberRequestResult(payload=payload, phone=phone_number)
 
             return None
 
