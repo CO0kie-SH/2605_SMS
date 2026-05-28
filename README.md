@@ -1,7 +1,7 @@
 # HeroSMS Python 调试工具集
 
-> 当前版本：`26.5.27A`  
-> 最后更新：`2026-05-27`  
+> 当前版本：`26.5.28A`  
+> 最后更新：`2026-05-28`  
 > 项目定位：合法合规地调试 HeroSMS / SMS-Activate 风格 API，重点用于观察余额、价格、库存、号码请求、活动激活状态、状态变更与完整工作流。
 
 ---
@@ -21,6 +21,8 @@
 - 验证成功号码是否真实进入活动激活列表
 - 支持按 `0.025-0.03-0.035` 这类多级价格逐档查询和申请号码
 - 号码请求阶段会校验 HTTP 200 响应中是否真实包含手机号，避免 `NO_NUMBERS` 被误判为成功
+- 支持号码申请失败后的 `--run-loop` 大循环，从头重新读取配置、余额、活动列表与商户候选
+- 支持通过 `tools/feishu.py` 在号码活动列表确认阶段发送飞书通知
 - 支持交互式将激活状态改为 `3`（请求重发短信）、`6`（完成）或 `8`（退款）
 - 支持本地组合 `9` 模式：处理旧激活、确认列表清空、按原服务/国家/商家校验价格并重新申请号码
 - 支持查询历史记录与记录日志
@@ -35,6 +37,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| `26.5.28A` | 2026-05-28 | 新增 `tools/feishu.py` 飞书通知工具类，在普通号码申请和 `9-序号` 重开新号的活动列表确认阶段播报“号码是否存在于当前激活列表”；新增 `--run-loop` 大循环命令行参数，当号码申请阶段商户列表耗尽并未获得成功号码响应时，重新读取 `.env` 并从余额、活动列表、商户生成开始整体重跑；补充 README 与单元测试覆盖 |
 | `26.5.27A` | 2026-05-27 | 修复 `getNumberV2` 返回 HTTP 200 但响应内容为 `NO_NUMBERS` 或其他无手机号内容时被误判为成功的问题；现在会将这类响应视为业务失败，移除当前商户并继续请求下一个商户；补充单元测试覆盖 HTTP 200 无号码后继续申请的场景 |
 | `26.5.26A` | 2026-05-26 | 新增多级价格阶梯，`--max-price` / `HEROSMS_MAX_PRICE` 支持 `0.025-0.03-0.035` 格式并按档位逐级查询商户和申请号码；号码申请次数改为按当前商户候选数量自适应；余额查询阶段输出按最高价格估算的可购买次数；`service=dr` 候选生成加入 `country=4` 黑名单；用户输入轮询自然结束后新增自动收尾检查，唯一未收到验证码的活动记录会自动执行 `status=8`；同步 `.env.example`、README 与测试 |
 | `26.5.23A` | 2026-05-23 | 修复 Windows 下 `select.select(sys.stdin)` 导致的 `WinError 10038`；新增 `3/3-序号` 请求重发短信模式；新增本地组合 `9/9-序号` 处理后重开模式，并在成功申请新号后进入活动列表 25 次轮询；抽取号码申请重试循环供主流程和 9 模式复用；用户输入轮询默认次数从 100 调整为 50；补充 README 与单元测试覆盖 |
@@ -107,6 +110,11 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 ├── get_active_activations.py    # 活动激活列表与 setStatus
 ├── get_history.py               # 查询历史记录
 ├── herosms_tool.py              # 统一工作流入口（推荐主入口）
+├── config/
+│   └── FeiShu.csv               # 飞书机器人配置（本地 webhook 配置）
+├── tools/
+│   ├── __init__.py
+│   └── feishu.py                # 飞书通知工具类
 ├── tests/
 │   └── test_herosms_tool.py     # herosms_tool 单元测试
 ├── log/                         # 运行日志目录
@@ -142,11 +150,26 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 
 - 默认 **dry-run**，不会真实发送号码请求
 - 只有显式加 `--send` 才会发起真实 `getNumberV2`
+- 如需号码申请失败后从头重跑完整流程，可显式加 `--run-loop`
+- 号码进入活动列表确认阶段会尝试发送飞书通知；通知失败只记录日志，不中断主流程
 - `9-序号` 会先处理旧激活再申请新号码，因此也必须显式加 `--send`
 - 默认是单线程保护模式，活动列表非空时会阻止继续请求新号码
 - `status=8` 退款时，如果记录中已有 `smsCode` 或 `smsText`，会拒绝退款
 
-### 今日任务梳理（26.5.27A）
+### 今日任务梳理（26.5.28A）
+
+本版本围绕通知能力和号码失败后的自动重跑做了以下更新：
+
+1. 新建 `tools` 工具目录，并新增 `tools/feishu.py`。
+2. `FeishuNotifier` 会读取 `config/FeiShu.csv`，支持 `none`、`text`、`post` / `title` 模式。
+3. 普通 `run` 流程在获取号码并查询活动列表后，会飞书播报“号码 +xxx 存在/不存在于当前激活列表”。
+4. `9-序号` 重开新号成功后，同样会在活动列表确认阶段发送飞书通知。
+5. 飞书通知失败不会中断主流程，只会记录 `[飞书通知] 发送失败`。
+6. 新增命令行参数 `--run-loop`，用于号码申请阶段失败后的完整大循环。
+7. 当商户列表耗尽并输出 `[失败] 未获得成功号码响应` 时，`--run-loop` 会重新读取 `.env`，并从余额查询、活动列表查询、商户生成开始整体重跑。
+8. 补充飞书通知调用和 `--run-loop` 重跑逻辑相关测试。
+
+### 历史任务梳理（26.5.27A）
 
 本版本修复号码申请阶段的成功判断瑕疵：
 
@@ -250,6 +273,7 @@ python3 herosms_tool.py run [参数...]
 | `--max-price` | `None` | 最高价格，优先级高于 `HEROSMS_MAX_PRICE`；支持 `0.025-0.03-0.035` 多级价格 |
 | `--merchant-seed` | `None` | 商户抽取随机种子，用于复现抽样 |
 | `--retry-limit` | `10` | 获取商户 / 号码累计重试次数上限 |
+| `--run-loop` | 关闭 | 号码申请失败且未获得成功号码响应时，重新读取 `.env` 并从流程第 1 步整体重跑 |
 | `--send` | 关闭 | 真实发送号码请求；默认 dry-run |
 | `--multi-thread` | 关闭 | 跳过单线程检查的预留开关 |
 | `--visible-only` | 关闭 | 只从 `visible=1` 的国家中选择 |
@@ -277,6 +301,14 @@ python3 herosms_tool.py run --service dr
 ```bash
 python3 herosms_tool.py run --service dr --send
 ```
+
+号码申请失败后从头大循环：
+
+```bash
+python3 herosms_tool.py run --service dr --send --run-loop
+```
+
+`--run-loop` 只会在号码阶段未获得成功响应时触发，例如当前商户列表耗尽后输出 `[失败] 未获得成功号码响应`。触发后会重新读取 `.env`，重新查询余额、活动激活列表、商户列表并再次申请号码。
 
 固定抽样种子：
 
@@ -325,6 +357,14 @@ python3 herosms_tool.py run --service dr --max-price 0.025-0.03-0.035 --send
 4. 价格符合限额时，复用普通号码申请的重试循环继续申请号码。
 
 ### 近期行为变更
+
+#### 26.5.28A
+
+- 新增 `tools/feishu.py`，将飞书 webhook 通知能力整理成项目内工具类。
+- 普通号码申请成功后，查询活动列表确认号码是否存在时，会发送飞书通知。
+- `9-序号` 重新申请号码成功后，也会在活动列表确认阶段发送飞书通知。
+- 新增 `--run-loop` 参数；号码阶段未获得成功响应时，会重新读取 `.env` 并从完整 `run` 流程开头重跑。
+- `--run-loop` 只针对号码申请阶段的可重启失败生效，余额不足、活动列表非空、配置错误等失败不会触发大循环。
 
 #### 26.5.27A
 
@@ -568,10 +608,10 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 & D:\0Code2\py312\python.exe -m pytest -q
 ```
 
-本次文档更新前已确认（2026-05-27）：
+本次文档更新前已确认（2026-05-28）：
 
-- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_prices.py tests\test_herosms_tool.py tests\test_get_prices.py` 通过
-- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `37 passed in 8.36s`
+- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py tests\test_herosms_tool.py tools\feishu.py` 通过
+- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `39 passed in 8.63s`
 
 ---
 
@@ -579,14 +619,15 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 
 本次会话主要变更集中在：
 
-- `README.md`：更新版本号、版本日志、今日任务梳理、近期行为变更和验证记录
-- `herosms_tool.py`：修复 HTTP 200 但响应中没有手机号时被误判为号码申请成功的问题
-- `tests/test_herosms_tool.py`：补充 HTTP 200 无号码响应后继续尝试下一个商户的测试覆盖
+- `README.md`：更新版本号、版本日志、今日任务梳理、近期行为变更、参数说明和验证记录
+- `tools/__init__.py`、`tools/feishu.py`：新增项目内飞书通知工具类
+- `herosms_tool.py`：接入飞书通知，并新增 `--run-loop` 大循环执行逻辑
+- `tests/test_herosms_tool.py`：补充飞书通知调用、`--run-loop` 参数解析和大循环重跑测试
 
 如需后续做版本提交，建议先：
 
 ```bash
-git add README.md herosms_tool.py tests/test_herosms_tool.py
+git add README.md herosms_tool.py tests/test_herosms_tool.py tools/
 ```
 
 再继续检查 staged diff。

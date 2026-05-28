@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from herosms_tool import (
+    execute_workflow,
     HeroSMSWorkflow,
     NumberRequestResult,
     UserInputExit,
@@ -18,6 +19,15 @@ from herosms_tool import (
     parse_balance_value,
     parse_float_levels,
 )
+
+
+class FakeFeishuNotifier:
+    def __init__(self):
+        self.calls = []
+
+    def notify_phone_active_presence(self, phone, exists):
+        self.calls.append((phone, exists))
+        return {"test": True}
 
 
 def test_parse_args_cli_values_override_environment_defaults():
@@ -44,6 +54,14 @@ def test_parse_args_cli_values_override_environment_defaults():
     assert config.service == "dr"
     assert config.merchant_seed == 7
     assert config.retry_limit == 9
+
+
+def test_parse_args_supports_run_loop():
+    args = parse_args(["run", "--run-loop"])
+
+    config = WorkflowConfig.from_args(args, env={})
+
+    assert config.run_loop is True
 
 
 def test_parse_args_uses_environment_when_cli_omits_values():
@@ -153,9 +171,11 @@ def test_run_retries_non_200_and_continues_until_success():
     workflow.poll_active_list = lambda: None
     workflow.user_input_loop = lambda initial_records=None, prompt=None: None
     workflow.print_history = lambda: None
+    workflow.feishu_notifier = FakeFeishuNotifier()
 
     assert workflow.run() == 0
     assert calls == ["bad", "ok"]
+    assert workflow.feishu_notifier.calls == [("+5550001", True)]
 
 
 def test_run_accumulates_retry_count_when_no_merchants_then_exits(monkeypatch):
@@ -176,6 +196,33 @@ def test_run_accumulates_retry_count_when_no_merchants_then_exits(monkeypatch):
 
     assert workflow.run() == 1
     assert build_calls["count"] == 3
+    assert workflow.last_run_restartable is True
+
+
+def test_execute_workflow_restarts_when_number_request_is_restartable(monkeypatch):
+    args = parse_args(["run", "--run-loop", "--send", "--max-price", "0.5"])
+    run_results = [1, 0]
+    workflows = []
+
+    class FakeWorkflow:
+        def __init__(self, config, logger):
+            self.config = config
+            self.logger = logger
+            self.last_run_restartable = True
+            workflows.append(self)
+
+        def run(self):
+            result = run_results.pop(0)
+            self.last_run_restartable = result == 1
+            return result
+
+    monkeypatch.setattr("herosms_tool.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("herosms_tool.setup_logging", lambda log_dir: logging.getLogger("test"))
+    monkeypatch.setattr("herosms_tool.HeroSMSWorkflow", FakeWorkflow)
+
+    assert execute_workflow(args) == 0
+    assert len(workflows) == 2
+    assert run_results == []
 
 
 def test_run_accumulates_retry_count_across_merchant_and_number_failures():
@@ -235,6 +282,7 @@ def test_run_resets_retry_count_after_number_success():
     workflow.poll_active_list = lambda: None
     workflow.user_input_loop = lambda initial_records=None, prompt=None: None
     workflow.print_history = lambda: None
+    workflow.feishu_notifier = FakeFeishuNotifier()
 
     assert workflow.run() == 0
     assert calls == ["bad", "ok"]
@@ -449,6 +497,7 @@ def test_user_input_nine_refunds_empty_list_then_requests_replacement():
     )
     workflow.poll_balance_change = lambda before_balance: None
     workflow.poll_active_list = lambda: polled.__setitem__("active", True)
+    workflow.feishu_notifier = FakeFeishuNotifier()
 
     state = workflow.handle_user_input("9-1", UserInputState())
 
@@ -458,6 +507,7 @@ def test_user_input_nine_refunds_empty_list_then_requests_replacement():
     assert printed[1] == []
     assert polled["active"]
     assert state.records == active_after_new_number
+    assert workflow.feishu_notifier.calls == [("+5550009", True)]
 
 
 def test_user_input_nine_completes_record_with_sms_payload():
@@ -483,11 +533,13 @@ def test_user_input_nine_completes_record_with_sms_payload():
     )
     workflow.poll_balance_change = lambda before_balance: None
     workflow.poll_active_list = lambda: polled.__setitem__("active", True)
+    workflow.feishu_notifier = FakeFeishuNotifier()
 
     workflow.handle_user_input("9-1", UserInputState())
 
     assert requested_statuses == [("first", 6)]
     assert polled["active"]
+    assert workflow.feishu_notifier.calls == [("+5550010", True)]
 
 
 def test_user_input_nine_stops_when_active_list_is_not_empty_after_status():

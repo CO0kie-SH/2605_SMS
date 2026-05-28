@@ -37,6 +37,7 @@ from get_number_v2 import build_request_params, parse_response_payload, print_re
 from get_operator_prices import load_operator_prices
 from get_prices import build_get_number_v2_candidates
 from get_service_coverage import build_coverage
+from tools.feishu import FeishuNotifier
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_BASE_URL = "https://hero-sms.com/stubs/handler_api.php"
@@ -99,6 +100,7 @@ class WorkflowConfig:
     service: str = "dr"
     merchant_seed: int | None = None
     retry_limit: int = 10
+    run_loop: bool = False
     send: bool = False
     multi_thread: bool = False
     visible_only: bool = False
@@ -132,6 +134,7 @@ class WorkflowConfig:
             service=args.service,
             merchant_seed=args.merchant_seed,
             retry_limit=args.retry_limit,
+            run_loop=args.run_loop,
             send=args.send,
             multi_thread=args.multi_thread,
             visible_only=args.visible_only,
@@ -152,6 +155,8 @@ class HeroSMSWorkflow:
     def __init__(self, config: WorkflowConfig, logger: logging.Logger | None = None):
         self.config = config
         self.logger = logger or logging.getLogger("herosms_tool")
+        self.feishu_notifier = FeishuNotifier(logger=self.logger)
+        self.last_run_restartable = False
 
     def log_and_print(self, message: str, level: int = logging.INFO) -> None:
         print(message, flush=True)
@@ -282,6 +287,13 @@ class HeroSMSWorkflow:
                 if current and (current == wanted or current.endswith(wanted) or wanted.endswith(current)):
                     return True
         return False
+
+    def notify_phone_active_presence(self, phone_number: str, exists: bool) -> None:
+        display_phone = self._display_phone(phone_number)
+        try:
+            self.feishu_notifier.notify_phone_active_presence(display_phone, exists)
+        except Exception as error:
+            self.log_and_print(f"[飞书通知] 发送失败: {error}", logging.WARNING)
 
     def print_active_records(self, records: list[dict]) -> None:
         print_active_activations(records)
@@ -476,7 +488,9 @@ class HeroSMSWorkflow:
         except Exception as error:
             self.log_and_print(f"[9模式错误] 获取激活列表失败: {error}", logging.ERROR)
             return UserInputState()
-        if self.phone_exists_in_records(result.phone, records_after):
+        phone_exists = self.phone_exists_in_records(result.phone, records_after)
+        self.notify_phone_active_presence(result.phone, phone_exists)
+        if phone_exists:
             self.log_and_print(f"[9模式确认] 电话号码 {self._display_phone(result.phone)} 存在于活动激活列表")
         else:
             self.log_and_print(
@@ -819,6 +833,7 @@ class HeroSMSWorkflow:
         return None
 
     def run(self) -> int:
+        self.last_run_restartable = False
         self.log_and_print("[流程] 1. 读取配置完成，开始查询余额")
         try:
             balance_text = self.get_balance()
@@ -865,6 +880,7 @@ class HeroSMSWorkflow:
         self.log_and_print("[流程] 3. 查询服务国家和商户，生成商户列表")
         number_result = self.obtain_number_with_retry()
         if number_result is None:
+            self.last_run_restartable = True
             self.log_and_print("[失败] 未获得成功号码响应", logging.ERROR)
             return 1
         if number_result.dry_run:
@@ -879,7 +895,9 @@ class HeroSMSWorkflow:
         except Exception as error:
             self.log_and_print(f"[错误] 获取激活列表失败: {error}", logging.ERROR)
             return 1
-        if self.phone_exists_in_records(number_result.phone, records_after):
+        phone_exists = self.phone_exists_in_records(number_result.phone, records_after)
+        self.notify_phone_active_presence(number_result.phone, phone_exists)
+        if phone_exists:
             self.log_and_print(f"[确认] 电话号码 {self._display_phone(number_result.phone)} 存在于活动激活列表")
         else:
             self.log_and_print(f"[警告] 电话号码 {self._display_phone(number_result.phone)} 不存在于活动激活列表，退出", logging.WARNING)
@@ -928,6 +946,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--merchant-seed", type=int, default=None, help="商户抽取随机种子")
     parser.add_argument("--retry-limit", type=int, default=10, help="获取商户/号码累计重试次数上限，超过后退出，默认 10")
+    parser.add_argument("--run-loop", action="store_true", help="号码申请失败时重新读取 env 并从头重跑整个流程")
     parser.add_argument("--send", action="store_true", help="真实发送号码请求；默认 dry-run")
     parser.add_argument("--multi-thread", action="store_true", help="启用多线程模式预留开关；当前仅作为跳过单线程检查")
     parser.add_argument("--visible-only", action="store_true", help="只从 visible=1 的国家中选择")
@@ -944,17 +963,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def execute_workflow(args: argparse.Namespace) -> int:
+    attempt = 1
+    while True:
+        load_dotenv(PROJECT_DIR / ".env", override=True)
+        try:
+            config = WorkflowConfig.from_args(args)
+        except ValueError as error:
+            print(f"[错误] 配置解析失败: {error}")
+            return 2
+
+        logger = setup_logging(config.log_dir)
+        workflow = HeroSMSWorkflow(config=config, logger=logger)
+        result = workflow.run()
+        if result == 0:
+            return 0
+        if not config.run_loop or not workflow.last_run_restartable:
+            return result
+        attempt += 1
+        print(f"[大循环] 第{attempt}轮重新读取 env 并从头执行")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    load_dotenv(PROJECT_DIR / ".env")
     args = parse_args(argv)
-    try:
-        config = WorkflowConfig.from_args(args)
-    except ValueError as error:
-        print(f"[错误] 配置解析失败: {error}")
-        return 2
-    logger = setup_logging(config.log_dir)
-    workflow = HeroSMSWorkflow(config=config, logger=logger)
-    return workflow.run()
+    return execute_workflow(args)
 
 
 if __name__ == "__main__":
