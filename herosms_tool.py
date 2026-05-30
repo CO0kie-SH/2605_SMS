@@ -92,6 +92,115 @@ class NumberRequestResult:
 
 
 @dataclass(frozen=True)
+class SmsSnapshot:
+    collected_at: float
+    activation_id: str
+    phone: str
+    sms_code: str
+    sms_text: str
+    display_value: str
+    source: str
+    timeout_seconds: float | None = None
+
+
+class SmsActivationTracker:
+    def __init__(self, clock: Callable[[], float] | None = None):
+        self.clock = clock or time.time
+        self.history_by_id: dict[str, list[SmsSnapshot]] = {}
+
+    @staticmethod
+    def _first_record_value(record: dict, keys: Sequence[str]) -> str:
+        for key in keys:
+            value = str(record.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def extract_sms_identity(cls, record: dict) -> tuple[str, str, str, str, str]:
+        activation_id = cls._first_record_value(record, ("activationId", "id"))
+        phone = cls._first_record_value(record, ("phoneNumber", "phone", "number"))
+        sms_code = cls._first_record_value(record, ("smsCode",))
+        sms_text = cls._first_record_value(record, ("smsText",))
+        display_parts = []
+        if sms_code:
+            display_parts.append(f"smsCode={sms_code}")
+        if sms_text:
+            display_parts.append(f"smsText={sms_text}")
+        display_value = " | ".join(display_parts)
+        return activation_id, phone, sms_code, sms_text, display_value
+
+    def record(self, records: list[dict], source: str, timeout_seconds: float | None = None) -> list[SmsSnapshot]:
+        collected_at = self.clock()
+        snapshots = []
+        for record in records:
+            activation_id, phone, sms_code, sms_text, display_value = self.extract_sms_identity(record)
+            if not activation_id:
+                continue
+            snapshot = SmsSnapshot(
+                collected_at=collected_at,
+                activation_id=activation_id,
+                phone=phone,
+                sms_code=sms_code,
+                sms_text=sms_text,
+                display_value=display_value,
+                source=source,
+                timeout_seconds=timeout_seconds,
+            )
+            self.history_by_id.setdefault(activation_id, []).append(snapshot)
+            snapshots.append(snapshot)
+        return snapshots
+
+    def latest_history(self, activation_id: str) -> list[SmsSnapshot]:
+        return self.history_by_id.get(activation_id, [])
+
+    @staticmethod
+    def _last_distinct_values(history: list[SmsSnapshot], limit: int = 3) -> list[SmsSnapshot]:
+        distinct = []
+        seen_values = set()
+        for snapshot in reversed(history):
+            value_key = snapshot.display_value or "<无验证码>"
+            if value_key in seen_values:
+                continue
+            seen_values.add(value_key)
+            distinct.append(snapshot)
+            if len(distinct) >= limit:
+                break
+        return distinct
+
+    @staticmethod
+    def seconds_since_previous_change(history: list[SmsSnapshot]) -> float | None:
+        distinct = SmsActivationTracker._last_distinct_values(history, limit=2)
+        if len(distinct) < 2:
+            return None
+        return max(0.0, distinct[0].collected_at - distinct[1].collected_at)
+
+    def summarize(self, record: dict) -> str | None:
+        activation_id, phone, sms_code, sms_text, display_value = self.extract_sms_identity(record)
+        if not activation_id:
+            return None
+        history = self.latest_history(activation_id)
+        if history:
+            latest = history[-1]
+            phone = phone or latest.phone
+            sms_code = sms_code or latest.sms_code
+            sms_text = sms_text or latest.sms_text
+            display_value = display_value or latest.display_value
+        distinct = self._last_distinct_values(history, limit=3)
+        previous = distinct[1].display_value if len(distinct) >= 2 else "-"
+        previous_previous = distinct[2].display_value if len(distinct) >= 3 else "-"
+        changed_seconds = self.seconds_since_previous_change(history)
+        changed_text = "-" if changed_seconds is None else f"{changed_seconds:.1f}s"
+        timeout_seconds = history[-1].timeout_seconds if history else None
+        timeout_text = "-" if timeout_seconds is None else f"{timeout_seconds:g}s"
+        return (
+            f"id={activation_id} phone={phone or '-'} smsCode={sms_code or '-'} smsText={sms_text or '-'} "
+            f"当前={display_value or '<无验证码>'} 上次={previous or '<无验证码>'} "
+            f"上上次={previous_previous or '<无验证码>'} 不同间隔={changed_text} timeout={timeout_text}"
+        )
+
+
+@dataclass(frozen=True)
 class WorkflowConfig:
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
@@ -156,6 +265,7 @@ class HeroSMSWorkflow:
         self.config = config
         self.logger = logger or logging.getLogger("herosms_tool")
         self.feishu_notifier = FeishuNotifier(logger=self.logger)
+        self.sms_tracker = SmsActivationTracker()
         self.last_run_restartable = False
 
     def log_and_print(self, message: str, level: int = logging.INFO) -> None:
@@ -299,12 +409,49 @@ class HeroSMSWorkflow:
         print_active_activations(records)
         self.logger.info("active_records=%s", json.dumps(records, ensure_ascii=False, default=str))
 
+    def record_sms_snapshots(
+        self,
+        records: list[dict],
+        source: str,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        # 记录验证码快照用于用户输入轮询期间对比多次短信变化。
+        snapshots = self.sms_tracker.record(records, source=source, timeout_seconds=timeout_seconds)
+        self.log_and_print(
+            f"[验证码记录] 来源={source} 记录数量={len(snapshots)} timeout={timeout_seconds if timeout_seconds is not None else '-'}"
+        )
+        for record in records:
+            summary = self.summarize_sms_history(record)
+            if summary:
+                self.log_and_print(f"[验证码记录明细] {summary}")
+
+    def summarize_sms_history(self, record: dict) -> str | None:
+        return self.sms_tracker.summarize(record)
+
+    def print_and_record_active_records(
+        self,
+        records: list[dict],
+        source: str,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self.print_active_records(records)
+        self.record_sms_snapshots(records, source=source, timeout_seconds=timeout_seconds)
+
+    def fetch_print_and_record_active_records(
+        self,
+        source: str,
+        timeout_seconds: float | None = None,
+    ) -> list[dict]:
+        records = self.get_active_records(limit=self.config.active_limit)
+        self.print_and_record_active_records(records, source=source, timeout_seconds=timeout_seconds)
+        return records
+
     def poll_active_list(self) -> None:
         for index in range(self.config.active_poll_times):
             self.log_and_print(f"[活动激活轮询] #{index + 1}/{self.config.active_poll_times}")
             try:
                 records = self.get_active_records(limit=self.config.active_limit)
-                self.print_active_records(records)
+                self.print_and_record_active_records(records, source="活动激活轮询")
             except Exception as error:
                 self.log_and_print(f"[活动激活轮询] 查询失败: {error}", logging.WARNING)
             if index < self.config.active_poll_times - 1:
@@ -368,14 +515,13 @@ class HeroSMSWorkflow:
             raise UserInputExit()
 
         if text == "0":
-            records = self.get_active_records(limit=self.config.active_limit)
-            self.print_active_records(records)
+            records = self.fetch_print_and_record_active_records(source="0查询")
             return UserInputState()
 
         if text in {"3", "6", "8", "9"}:
             mode = int(text)
-            records = self.get_active_records(limit=self.config.active_limit)
-            self.print_active_records(records)
+            source = "进入3模式" if mode == 3 else f"进入{mode}模式"
+            records = self.fetch_print_and_record_active_records(source=source)
             mode_text = {3: "请求重发短信", 6: "完成", 8: "退款", 9: "处理后重开"}[mode]
             self.log_and_print(f"[模式] 进入{mode_text}模式；输入 {mode}-序号 执行，例如 {mode}-1")
             return UserInputState(mode=mode, records=records)
@@ -387,8 +533,7 @@ class HeroSMSWorkflow:
                 return state
             requested_mode = int(prefix)
             if requested_mode == 9 and state.mode is None:
-                records = self.get_active_records(limit=self.config.active_limit)
-                self.print_active_records(records)
+                records = self.fetch_print_and_record_active_records(source="9模式直接执行前查询")
                 return self.handle_mode_9_by_index(index_text, records)
             if state.mode is None or requested_mode != state.mode:
                 self.log_and_print(f"[输入无效] 当前模式不是 {requested_mode}，请先输入 {requested_mode}", logging.WARNING)
@@ -415,8 +560,8 @@ class HeroSMSWorkflow:
                 return state
             self.set_activation_status(activation_id=activation_id, status=requested_mode)
             self.log_and_print(f"[模式] 已对第 {index_text} 条 activationId={activation_id} 执行 status={requested_mode}")
-            refreshed_records = self.get_active_records(limit=self.config.active_limit)
-            self.print_active_records(refreshed_records)
+            refresh_source = "执行3模式后刷新" if requested_mode == 3 else f"执行{requested_mode}模式后刷新"
+            refreshed_records = self.fetch_print_and_record_active_records(source=refresh_source)
             return UserInputState()
 
         self.log_and_print(
@@ -446,8 +591,7 @@ class HeroSMSWorkflow:
         self.log_and_print(f"[9模式] 第 {index_text} 条 activationId={activation_id}，先执行 status={status}({status_text})")
         self.set_activation_status(activation_id=activation_id, status=status)
 
-        active_records = self.get_active_records(limit=self.config.active_limit)
-        self.print_active_records(active_records)
+        active_records = self.fetch_print_and_record_active_records(source="9模式处理后查询")
         if active_records:
             self.log_and_print("[9模式警告] 当前活动激活列表不为空，不允许 9 模式继续申请号码", logging.WARNING)
             return UserInputState(records=active_records)
@@ -497,7 +641,7 @@ class HeroSMSWorkflow:
                 f"[9模式警告] 电话号码 {self._display_phone(result.phone)} 不存在于活动激活列表",
                 logging.WARNING,
             )
-            print_active_activations(records_after)
+            self.print_and_record_active_records(records_after, source="9模式确认失败")
             return UserInputState(records=records_after)
 
         self.log_and_print("[9模式] 进入活动激活列表轮询")
@@ -615,9 +759,21 @@ class HeroSMSWorkflow:
         )
         state = UserInputState(records=initial_records)
         if initial_records is not None:
-            self.print_active_records(initial_records)
+            self.print_and_record_active_records(initial_records, source="用户输入初始列表")
         for index in range(self.config.input_poll_times):
-            self.log_and_print(f"[用户输入轮询] #{index + 1}/{self.config.input_poll_times} 等待输入")
+            self.log_and_print(
+                f"[用户输入轮询] #{index + 1}/{self.config.input_poll_times} "
+                f"刷新活动列表并等待输入 timeout={self.config.input_poll_interval:g}s"
+            )
+            try:
+                # 每轮等待前主动刷新活动列表，便于记录验证码到达和变化耗时。
+                refreshed_records = self.fetch_print_and_record_active_records(
+                    source="用户输入轮询",
+                    timeout_seconds=float(self.config.input_poll_interval),
+                )
+                state = UserInputState(mode=state.mode, records=refreshed_records)
+            except Exception as error:
+                self.log_and_print(f"[用户输入轮询] 刷新活动激活列表失败，继续等待输入: {error}", logging.WARNING)
             user_input = self.read_user_input_with_timeout(self.config.input_poll_interval)
             if user_input is not None:
                 try:
@@ -636,7 +792,7 @@ class HeroSMSWorkflow:
             self.log_and_print(f"[自动收尾] 查询活动激活列表失败: {error}", logging.WARNING)
             return
 
-        self.print_active_records(records)
+        self.print_and_record_active_records(records, source="自动收尾")
         if len(records) != 1:
             self.log_and_print(f"[自动收尾] 当前活动激活数量={len(records)}，不满足自动 8 条件")
             return
@@ -665,7 +821,7 @@ class HeroSMSWorkflow:
 
         try:
             refreshed_records = self.get_active_records(limit=self.config.active_limit)
-            self.print_active_records(refreshed_records)
+            self.print_and_record_active_records(refreshed_records, source="自动收尾status8后刷新")
         except Exception as error:
             self.log_and_print(f"[自动收尾] status=8 后刷新活动列表失败: {error}", logging.WARNING)
 

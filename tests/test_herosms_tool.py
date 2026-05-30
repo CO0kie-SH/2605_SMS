@@ -395,17 +395,44 @@ def test_phone_presence_checks_common_fields():
     assert not workflow.phone_exists_in_records("5550003", [{"phoneNumber": "5550004"}])
 
 
+def test_sms_tracker_records_code_text_and_change_seconds():
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    times = iter([100.0, 125.5])
+    workflow.sms_tracker.clock = lambda: next(times)
+    messages = []
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsCode": "111111", "smsText": "first"}],
+        source="测试首次",
+    )
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsCode": "222222", "smsText": "second"}],
+        source="测试变化",
+        timeout_seconds=10,
+    )
+
+    summary = workflow.summarize_sms_history({"activationId": "a1"})
+    assert "当前=smsCode=222222 | smsText=second" in summary
+    assert "上次=smsCode=111111 | smsText=first" in summary
+    assert "不同间隔=25.5s" in summary
+    assert "timeout=10s" in summary
+    assert any("[验证码记录明细]" in message for message in messages)
+
+
 def test_user_input_zero_prints_active_list():
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
     records = [{"activationId": "a1"}]
     calls = []
     workflow.get_active_records = lambda limit=100: records
-    workflow.print_active_records = lambda input_records: calls.append(input_records)
+    workflow.print_and_record_active_records = lambda input_records, source, timeout_seconds=None: calls.append(
+        (input_records, source, timeout_seconds)
+    )
 
     state = workflow.handle_user_input("0", UserInputState())
 
     assert state.mode is None
-    assert calls == [records]
+    assert calls == [(records, "0查询", None)]
 
 
 def test_user_input_six_enters_finish_mode_and_targets_first_record():
@@ -415,7 +442,9 @@ def test_user_input_six_enters_finish_mode_and_targets_first_record():
     requested = []
     printed = []
     workflow.get_active_records = lambda limit=100: records
-    workflow.print_active_records = lambda input_records: printed.append(input_records)
+    workflow.print_and_record_active_records = lambda input_records, source, timeout_seconds=None: printed.append(
+        (input_records, source)
+    )
     workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
 
     state = workflow.handle_user_input("6", UserInputState())
@@ -425,28 +454,33 @@ def test_user_input_six_enters_finish_mode_and_targets_first_record():
     workflow.get_active_records = lambda limit=100: refreshed_records
     state = workflow.handle_user_input("6-1", state)
     assert requested == [("first", 6)]
-    assert printed[-1] == refreshed_records
+    assert printed[-1] == (refreshed_records, "执行6模式后刷新")
     assert state.mode is None
 
 
 def test_user_input_three_enters_resend_mode_and_targets_first_record():
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
-    records = [{"activationId": "first"}]
-    refreshed_records = [{"activationId": "after"}]
+    records = [{"activationId": "first", "phoneNumber": "5550001", "smsCode": "111111"}]
+    refreshed_records = [{"activationId": "first", "phoneNumber": "5550001", "smsCode": "222222"}]
     requested = []
     printed = []
     workflow.get_active_records = lambda limit=100: records
-    workflow.print_active_records = lambda input_records: printed.append(input_records)
+    workflow.print_and_record_active_records = lambda input_records, source, timeout_seconds=None: (
+        workflow.record_sms_snapshots(input_records, source=source, timeout_seconds=timeout_seconds),
+        printed.append((input_records, source)),
+    )
     workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
 
     state = workflow.handle_user_input("3", UserInputState())
     assert state.mode == 3
     assert state.records == records
+    assert printed[-1] == (records, "进入3模式")
 
     workflow.get_active_records = lambda limit=100: refreshed_records
     state = workflow.handle_user_input("3-1", state)
     assert requested == [("first", 3)]
-    assert printed[-1] == refreshed_records
+    assert printed[-1] == (refreshed_records, "执行3模式后刷新")
+    assert "上次=smsCode=111111" in workflow.summarize_sms_history({"activationId": "first"})
     assert state.mode is None
 
 
@@ -457,7 +491,9 @@ def test_user_input_eight_enters_refund_mode_and_targets_first_record():
     requested = []
     printed = []
     workflow.get_active_records = lambda limit=100: records
-    workflow.print_active_records = lambda input_records: printed.append(input_records)
+    workflow.print_and_record_active_records = lambda input_records, source, timeout_seconds=None: printed.append(
+        (input_records, source)
+    )
     workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
 
     state = workflow.handle_user_input("8", UserInputState())
@@ -467,7 +503,7 @@ def test_user_input_eight_enters_refund_mode_and_targets_first_record():
     workflow.get_active_records = lambda limit=100: refreshed_records
     state = workflow.handle_user_input("8-1", state)
     assert requested == [("first", 8)]
-    assert printed[-1] == refreshed_records
+    assert printed[-1] == (refreshed_records, "执行8模式后刷新")
     assert state.mode is None
 
 
@@ -610,15 +646,67 @@ def test_user_input_loop_accepts_initial_records_and_exit(monkeypatch):
     )
     shown = []
     finalized = {"called": False}
-    workflow.print_active_records = lambda records: shown.append(records)
+    active_records = [[{"activationId": "loop"}]]
+    workflow.get_active_records = lambda limit=100: active_records.pop(0)
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: shown.append(
+        (records, source, timeout_seconds)
+    )
     workflow.read_user_input_with_timeout = lambda timeout: "99"
     workflow.finalize_after_input_timeout = lambda: finalized.__setitem__("called", True)
 
     with pytest.raises(UserInputExit):
         workflow.user_input_loop(initial_records=[{"activationId": "a1"}])
 
-    assert shown == [[{"activationId": "a1"}]]
+    assert shown == [
+        ([{"activationId": "a1"}], "用户输入初始列表", None),
+        ([{"activationId": "loop"}], "用户输入轮询", 0.0),
+    ]
     assert not finalized["called"]
+
+
+def test_user_input_loop_refreshes_active_list_before_each_wait():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", input_poll_times=2, input_poll_interval=3),
+        logger=logging.getLogger("test"),
+    )
+    active_records = [
+        [{"activationId": "a1", "smsCode": "111111"}],
+        [{"activationId": "a1", "smsCode": "222222"}],
+        [],
+    ]
+    printed = []
+    workflow.get_active_records = lambda limit=100: active_records.pop(0)
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: printed.append(
+        (records, source, timeout_seconds)
+    )
+    workflow.read_user_input_with_timeout = lambda timeout: None
+    workflow.finalize_after_input_timeout = lambda: printed.append(("finalized", None, None))
+
+    workflow.user_input_loop()
+
+    assert printed == [
+        ([{"activationId": "a1", "smsCode": "111111"}], "用户输入轮询", 3.0),
+        ([{"activationId": "a1", "smsCode": "222222"}], "用户输入轮询", 3.0),
+        ("finalized", None, None),
+    ]
+
+
+def test_user_input_loop_continues_when_refresh_fails():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", input_poll_times=1, input_poll_interval=0),
+        logger=logging.getLogger("test"),
+    )
+    called = {"input": False, "finalized": False}
+    messages = []
+    workflow.get_active_records = lambda limit=100: (_ for _ in ()).throw(RuntimeError("boom"))
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    workflow.read_user_input_with_timeout = lambda timeout: called.__setitem__("input", True)
+    workflow.finalize_after_input_timeout = lambda: called.__setitem__("finalized", True)
+
+    workflow.user_input_loop()
+
+    assert called == {"input": True, "finalized": True}
+    assert any("刷新活动激活列表失败" in message for message in messages)
 
 
 def test_user_input_loop_auto_refunds_single_record_without_sms_after_timeout():
@@ -626,25 +714,31 @@ def test_user_input_loop_auto_refunds_single_record_without_sms_after_timeout():
         WorkflowConfig(api_key="k", input_poll_times=1, input_poll_interval=0),
         logger=logging.getLogger("test"),
     )
-    active_records = [[{"activationId": "a1"}], []]
+    active_records = [[{"activationId": "loop"}], [{"activationId": "a1"}], []]
     requested = []
     printed = []
     workflow.read_user_input_with_timeout = lambda timeout: None
     workflow.get_active_records = lambda limit=100: active_records.pop(0)
-    workflow.print_active_records = lambda records: printed.append(records)
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: printed.append(
+        (records, source)
+    )
     workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
 
     workflow.user_input_loop()
 
     assert requested == [("a1", 8)]
-    assert printed == [[{"activationId": "a1"}], []]
+    assert printed == [
+        ([{"activationId": "loop"}], "用户输入轮询"),
+        ([{"activationId": "a1"}], "自动收尾"),
+        ([], "自动收尾status8后刷新"),
+    ]
 
 
 def test_finalize_after_input_timeout_does_not_refund_record_with_sms():
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
     requested = []
     workflow.get_active_records = lambda limit=100: [{"activationId": "a1", "smsCode": "123456"}]
-    workflow.print_active_records = lambda records: None
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: None
     workflow.set_activation_status = lambda activation_id, status: requested.append((activation_id, status))
 
     workflow.finalize_after_input_timeout()

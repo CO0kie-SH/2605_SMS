@@ -1,7 +1,7 @@
 # HeroSMS Python 调试工具集
 
-> 当前版本：`26.5.28A`  
-> 最后更新：`2026-05-28`  
+> 当前版本：`26.5.30A`  
+> 最后更新：`2026-05-30`  
 > 项目定位：合法合规地调试 HeroSMS / SMS-Activate 风格 API，重点用于观察余额、价格、库存、号码请求、活动激活状态、状态变更与完整工作流。
 
 ---
@@ -23,6 +23,7 @@
 - 号码请求阶段会校验 HTTP 200 响应中是否真实包含手机号，避免 `NO_NUMBERS` 被误判为成功
 - 支持号码申请失败后的 `--run-loop` 大循环，从头重新读取配置、余额、活动列表与商户候选
 - 支持通过 `tools/feishu.py` 在号码活动列表确认阶段发送飞书通知
+- 支持用户输入轮询期间持续记录验证码快照，展示当前、上次、上上次验证码与变化间隔
 - 支持交互式将激活状态改为 `3`（请求重发短信）、`6`（完成）或 `8`（退款）
 - 支持本地组合 `9` 模式：处理旧激活、确认列表清空、按原服务/国家/商家校验价格并重新申请号码
 - 支持查询历史记录与记录日志
@@ -37,6 +38,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| `26.5.30A` | 2026-05-30 | 新增验证码观察记录能力：用户输入轮询每轮等待前刷新活动激活列表，记录 activationId、号码、smsCode、smsText、采集时间和等待 timeout；活动列表输出后追加验证码摘要，展示当前、上次、上上次验证码以及与上一次不同验证码的间隔秒数；增强 `3` 请求重发短信模式的验证码基线与刷新后对比；补充中文日志、中文注释和单元测试 |
 | `26.5.28A` | 2026-05-28 | 新增 `tools/feishu.py` 飞书通知工具类，在普通号码申请和 `9-序号` 重开新号的活动列表确认阶段播报“号码是否存在于当前激活列表”；新增 `--run-loop` 大循环命令行参数，当号码申请阶段商户列表耗尽并未获得成功号码响应时，重新读取 `.env` 并从余额、活动列表、商户生成开始整体重跑；补充 README 与单元测试覆盖 |
 | `26.5.27A` | 2026-05-27 | 修复 `getNumberV2` 返回 HTTP 200 但响应内容为 `NO_NUMBERS` 或其他无手机号内容时被误判为成功的问题；现在会将这类响应视为业务失败，移除当前商户并继续请求下一个商户；补充单元测试覆盖 HTTP 200 无号码后继续申请的场景 |
 | `26.5.26A` | 2026-05-26 | 新增多级价格阶梯，`--max-price` / `HEROSMS_MAX_PRICE` 支持 `0.025-0.03-0.035` 格式并按档位逐级查询商户和申请号码；号码申请次数改为按当前商户候选数量自适应；余额查询阶段输出按最高价格估算的可购买次数；`service=dr` 候选生成加入 `country=4` 黑名单；用户输入轮询自然结束后新增自动收尾检查，唯一未收到验证码的活动记录会自动执行 `status=8`；同步 `.env.example`、README 与测试 |
@@ -123,7 +125,7 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 
 说明：
 
-- `herosms_tool.py`、`tests/`、`log/` 目前还是未跟踪文件，属于本地新增内容。
+- `herosms_tool.py`、`tests/`、`tools/`、`config/`、`log/` 目前还是未跟踪文件或本地新增内容。
 - `.venv/`、`__pycache__/`、`log/` 建议后续通过 `.gitignore` 管理。
 
 ---
@@ -152,11 +154,26 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 - 只有显式加 `--send` 才会发起真实 `getNumberV2`
 - 如需号码申请失败后从头重跑完整流程，可显式加 `--run-loop`
 - 号码进入活动列表确认阶段会尝试发送飞书通知；通知失败只记录日志，不中断主流程
+- 用户输入轮询期间会持续刷新活动列表并记录验证码快照，便于观察多次短信变化
 - `9-序号` 会先处理旧激活再申请新号码，因此也必须显式加 `--send`
 - 默认是单线程保护模式，活动列表非空时会阻止继续请求新号码
 - `status=8` 退款时，如果记录中已有 `smsCode` 或 `smsText`，会拒绝退款
 
-### 今日任务梳理（26.5.28A）
+### 今日任务梳理（26.5.30A）
+
+本版本围绕用户输入模式下的验证码记录、对比和日志可读性做了以下更新：
+
+1. 新增 `SmsSnapshot` 与 `SmsActivationTracker`，按 `activationId` 在运行内存中维护验证码历史。
+2. 用户输入轮询每轮等待前都会主动刷新活动激活列表，并记录本轮 `timeout`。
+3. 每次活动列表输出后会记录验证码快照，包含 `activationId`、号码、`smsCode`、`smsText`、采集时间和来源。
+4. 验证码摘要会展示当前、上次、上上次验证码，以及与上一次不同验证码之间的秒数。
+5. `3` 请求重发短信模式会在进入模式时记录当前验证码基线，执行 `3-序号` 后刷新并输出对比。
+6. 活动列表刷新失败时只记录警告，不中断用户输入轮询。
+7. 收敛“获取活动列表 + 打印 + 记录验证码”的重复逻辑，降低后续漏记风险。
+8. 补充中文日志和关键中文注释，便于从运行日志判断验证码何时到达、何时变化。
+9. 补充验证码记录、变化间隔、用户输入轮询刷新、刷新失败继续运行和 `3` 模式对比相关测试。
+
+### 历史任务梳理（26.5.28A）
 
 本版本围绕通知能力和号码失败后的自动重跑做了以下更新：
 
@@ -206,6 +223,8 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 2. **状态与配置层**
    - `WorkflowConfig`：统一承载全部运行参数，负责把命令行参数和环境变量合并成不可变配置对象
    - `UserInputState`：承载用户输入模式状态，记录当前是否处于 `3/6/8/9` 模式以及对应活动记录
+   - `SmsSnapshot`：记录单次验证码快照，包含采集时间、号码、`smsCode`、`smsText`、来源和 timeout
+   - `SmsActivationTracker`：按 `activationId` 维护验证码历史，并计算当前、上次、上上次验证码和变化间隔
    - `UserInputExit`：用于 `99` 主动退出流程，避免在多层调用中混乱返回
 
 3. **工作流执行层**
@@ -237,11 +256,13 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
   - `set_activation_status()`：统一发送 `setStatus`
   - `get_sms_payload_fields()`：识别短信是否已到达
   - 当记录已有 `smsCode` / `smsText` 时，禁止进入 `8` 退款模式
+  - `record_sms_snapshots()`：记录活动列表中的验证码快照
+  - `summarize_sms_history()`：输出验证码当前、上次、上上次和变化间隔摘要
 
 - **交互控制**
   - `handle_user_input()`：处理 `0`、`3`、`6`、`8`、`9`、`3-1`、`6-1`、`8-1`、`9-1`、`99`
   - `handle_mode_9_by_index()`：执行本地组合 9 模式，处理旧激活、校验活动列表、价格和库存，并复用号码申请重试循环
-  - `user_input_loop()`：做轮询式交互输入，Windows 下使用 `msvcrt`，其他平台使用 `select.select()`
+  - `user_input_loop()`：做轮询式交互输入；每轮等待前刷新活动列表并记录验证码，Windows 下使用 `msvcrt`，其他平台使用 `select.select()`
   - `finalize_after_input_timeout()`：用户输入轮询结束后自动检查唯一未收到短信的活动记录并执行 `status=8`
   - `print_history()`：统一查询历史记录
 
@@ -357,6 +378,14 @@ python3 herosms_tool.py run --service dr --max-price 0.025-0.03-0.035 --send
 4. 价格符合限额时，复用普通号码申请的重试循环继续申请号码。
 
 ### 近期行为变更
+
+#### 26.5.30A
+
+- 用户输入轮询每轮等待前会刷新活动激活列表并记录验证码快照。
+- 验证码记录同时展示 `smsCode` 与 `smsText`，并按 `activationId` 保留运行内历史。
+- 活动列表输出后新增 `[验证码记录]` 与 `[验证码记录明细]` 日志，展示当前、上次、上上次验证码和变化间隔。
+- `3` 请求重发短信模式会记录进入模式时的验证码基线，并在 `3-序号` 后刷新对比。
+- 活动列表刷新失败不会中断用户输入轮询，只记录警告并继续等待输入。
 
 #### 26.5.28A
 
@@ -608,10 +637,10 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 & D:\0Code2\py312\python.exe -m pytest -q
 ```
 
-本次文档更新前已确认（2026-05-28）：
+本次文档更新前已确认（2026-05-30）：
 
-- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py tests\test_herosms_tool.py tools\feishu.py` 通过
-- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `39 passed in 8.63s`
+- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_prices.py tests\test_herosms_tool.py tests\test_get_prices.py tools\feishu.py` 通过
+- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `42 passed in 2.97s`
 
 ---
 
@@ -620,14 +649,13 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 本次会话主要变更集中在：
 
 - `README.md`：更新版本号、版本日志、今日任务梳理、近期行为变更、参数说明和验证记录
-- `tools/__init__.py`、`tools/feishu.py`：新增项目内飞书通知工具类
-- `herosms_tool.py`：接入飞书通知，并新增 `--run-loop` 大循环执行逻辑
-- `tests/test_herosms_tool.py`：补充飞书通知调用、`--run-loop` 参数解析和大循环重跑测试
+- `herosms_tool.py`：新增验证码快照记录、验证码历史对比、用户输入轮询前刷新活动列表和 `3` 模式验证码基线对比
+- `tests/test_herosms_tool.py`：补充验证码记录、变化间隔、用户输入轮询刷新、刷新失败继续运行和 `3` 模式对比测试
 
 如需后续做版本提交，建议先：
 
 ```bash
-git add README.md herosms_tool.py tests/test_herosms_tool.py tools/
+git add README.md herosms_tool.py tests/test_herosms_tool.py
 ```
 
 再继续检查 staged diff。
