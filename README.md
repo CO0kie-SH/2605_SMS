@@ -1,7 +1,7 @@
 # HeroSMS Python 调试工具集
 
-> 当前版本：`26.5.30A`  
-> 最后更新：`2026-05-30`  
+> 当前版本：`26.5.31A`  
+> 最后更新：`2026-05-31`  
 > 项目定位：合法合规地调试 HeroSMS / SMS-Activate 风格 API，重点用于观察余额、价格、库存、号码请求、活动激活状态、状态变更与完整工作流。
 
 ---
@@ -24,6 +24,8 @@
 - 支持号码申请失败后的 `--run-loop` 大循环，从头重新读取配置、余额、活动列表与商户候选
 - 支持通过 `tools/feishu.py` 在号码活动列表确认阶段发送飞书通知
 - 支持用户输入轮询期间持续记录验证码快照，展示当前、上次、上上次验证码与变化间隔
+- 支持 `getRentNumber` 租号接口、租号时长分档试探和 `rent-run --run-loop` 失败后整体重跑
+- 租号成功进入活动列表后会记录申请时间 `unixtime`、成功 duration，并在验证码记录里输出等待时长
 - 支持交互式将激活状态改为 `3`（请求重发短信）、`6`（完成）或 `8`（退款）
 - 支持本地组合 `9` 模式：处理旧激活、确认列表清空、按原服务/国家/商家校验价格并重新申请号码
 - 支持查询历史记录与记录日志
@@ -38,6 +40,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| `26.5.31A` | 2026-05-31 | 新增 `getRentNumber` 租号接口支持，提供 `get_rent_number.py` 单接口脚本与 `herosms_tool.py rent-run` 独立流程；租号流程会查询余额、租号前活动列表、按 duration 分档请求、确认号码是否进入活动列表并进入原有轮询；`--duration` 支持 `24x7,24x6,...` 多档小时公式，单档最大 168 小时；`operator` 默认 `any`；`rent-run --run-loop` 在所有时长档位失败时会重新读取 `.env` 并从头重跑；租号成功后记录申请 `unixtime` 和成功 duration，验证码记录明细追加距离上次验证码/申请时间的等待分钟秒；补充国家备注、README 示例与单元测试 |
 | `26.5.30A` | 2026-05-30 | 新增验证码观察记录能力：用户输入轮询每轮等待前刷新活动激活列表，记录 activationId、号码、smsCode、smsText、采集时间和等待 timeout；活动列表输出后追加验证码摘要，展示当前、上次、上上次验证码以及与上一次不同验证码的间隔秒数；增强 `3` 请求重发短信模式的验证码基线与刷新后对比；补充中文日志、中文注释和单元测试 |
 | `26.5.28A` | 2026-05-28 | 新增 `tools/feishu.py` 飞书通知工具类，在普通号码申请和 `9-序号` 重开新号的活动列表确认阶段播报“号码是否存在于当前激活列表”；新增 `--run-loop` 大循环命令行参数，当号码申请阶段商户列表耗尽并未获得成功号码响应时，重新读取 `.env` 并从余额、活动列表、商户生成开始整体重跑；补充 README 与单元测试覆盖 |
 | `26.5.27A` | 2026-05-27 | 修复 `getNumberV2` 返回 HTTP 200 但响应内容为 `NO_NUMBERS` 或其他无手机号内容时被误判为成功的问题；现在会将这类响应视为业务失败，移除当前商户并继续请求下一个商户；补充单元测试覆盖 HTTP 200 无号码后继续申请的场景 |
@@ -159,7 +162,21 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 - 默认是单线程保护模式，活动列表非空时会阻止继续请求新号码
 - `status=8` 退款时，如果记录中已有 `smsCode` 或 `smsText`，会拒绝退款
 
-### 今日任务梳理（26.5.30A）
+### 今日任务梳理（26.5.31A）
+
+本版本围绕 HeroSMS 租号接口 `getRentNumber`、分段时长申请和租号后的验证码观察做了以下更新：
+
+1. 新增 `get_rent_number.py` 单接口脚本，支持 dry-run 和 `--send` 真实请求。
+2. 新增 `herosms_tool.py rent-run` 独立流程，不混入普通 `getNumberV2` 商户候选和价格阶梯逻辑。
+3. `rent-run` 会先查询余额，再查询租号前活动列表，随后按 duration 分档申请号码。
+4. `--duration` 支持单档和多档小时公式，例如 `24x7,24x6,24x5,24x4,24x3,24x2,24,12`，提交接口时会换算为 `168/144/120/96/72/48/24/12`。
+5. `operator` 默认值调整为 `any`，租号请求体默认带 `operator=any`。
+6. 租号成功后会确认号码是否存在于活动激活列表；如果响应体没有号码，会通过租号前后活动列表差异推断新增号码。
+7. 租号成功确认后记录申请 `unixtime`、成功申请的 duration，并在后续 `[验证码记录明细]` 中输出 `申请duration`、距离上次验证码或申请时间的等待分钟秒。
+8. `rent-run --run-loop` 会在所有时长档位均未获得成功号码时重新读取 `.env`，并从余额查询、活动列表查询和租号分段请求开始整体重跑。
+9. README 补充租号命令、国家码备注和最新测试结果；单元测试覆盖租号参数解析、分段时长、号码确认、验证码等待计时和租号大循环。
+
+### 历史任务梳理（26.5.30A）
 
 本版本围绕用户输入模式下的验证码记录、对比和日志可读性做了以下更新：
 
@@ -295,6 +312,12 @@ python3 herosms_tool.py run [参数...]
 | `--merchant-seed` | `None` | 商户抽取随机种子，用于复现抽样 |
 | `--retry-limit` | `10` | 获取商户 / 号码累计重试次数上限 |
 | `--run-loop` | 关闭 | 号码申请失败且未获得成功号码响应时，重新读取 `.env` 并从流程第 1 步整体重跑 |
+| `--country` | `16` | 租号 `rent-run` 国家 ID；`16` 为英国，`6` 为印度尼西亚，`48` 为荷兰，`117` 为葡萄牙 |
+| `--duration` | `2` | 租号 `rent-run` 时长小时数；支持 `2、4、12、24、24x2、24*3` 分档，提交时自动换算；单档最大 `24x7=168` |
+| `--operator` | `any` | 租号 `rent-run` 商家/运营商，默认 `any` |
+| `--cost` | `None` | 租号 `rent-run` 价格参数；提供后传给接口 |
+| `--currency` | `None` | 租号 `rent-run` 币种参数 |
+| `--ref` | `None` | 租号 `rent-run` ref 参数 |
 | `--send` | 关闭 | 真实发送号码请求；默认 dry-run |
 | `--multi-thread` | 关闭 | 跳过单线程检查的预留开关 |
 | `--visible-only` | 关闭 | 只从 `visible=1` 的国家中选择 |
@@ -351,6 +374,42 @@ python3 herosms_tool.py run --service dr --max-price 0.025-0.03-0.035 --send
 
 多级价格会按顺序重新查询商户列表并逐个申请号码。例如 `0.025-0.03-0.035` 会先用 `0.025` 查询并尝试该档全部商户；该档全部失败后，再用 `0.03` 查询并尝试；仍失败才进入 `0.035`。任一档成功后立即停止，不再尝试后续价格。
 
+租号接口 dry-run：
+
+```bash
+python3 herosms_tool.py rent-run --service dr --country 16 --duration 2、4、12、24、24x2、24x3 --cost 0.03
+```
+
+真实请求租号：
+
+```bash
+python3 herosms_tool.py rent-run --service dr --country 16 --duration 2、4、12、24、24x2、24x3 --cost 0.03 --send
+```
+
+租号失败后从头大循环：
+
+```bash
+python3 herosms_tool.py rent-run --service dr --country 16 --duration 2、4、12、24、24x2、24x3 --cost 0.03 --send --run-loop
+```
+
+当前实战租号命令：
+
+```bash
+python herosms_tool.py rent-run --service dr --country 16 --duration 24x7,24x6,24x5,24x4,24x3,24x2,24,12 --cost 0.06 --send --run-loop
+```
+
+备注：
+
+- `country=16` 为英国。
+- `country=6` 为印度尼西亚。
+- `country=48` 为荷兰。
+- `country=117` 为葡萄牙。
+- `rent-run` 使用 `getRentNumber`，`duration` 是租号时长小时数，不属于普通 `getNumberV2`；支持单档 `24`、公式 `24x2`/`24*2`，也支持多档 `2、4、12、24、24x2、24x3`。
+- 多档分隔符支持中文顿号 `、` 和英文逗号 `,`；不同终端里如果中文顿号不方便，可以写成 `2,4,12,24,24x2,24x3`。
+- 多档时长会按顺序申请号码，上一档未成功获得号码才尝试下一档；任一档成功后停止，单档最大为 7 天即 `168` 小时。
+- `rent-run --run-loop` 会在所有时长档位均未获得成功号码时重新读取 `.env`，并从余额查询、活动列表查询和租号分段请求开始整体重跑。
+- 如果返回 `404`，常见原因是当前条件下服务端没有可用租赁号码，或该服务/国家/价格组合暂不支持。
+
 ### 用户输入模式说明
 
 在 `herosms_tool.py` 的交互阶段可输入：
@@ -378,6 +437,15 @@ python3 herosms_tool.py run --service dr --max-price 0.025-0.03-0.035 --send
 4. 价格符合限额时，复用普通号码申请的重试循环继续申请号码。
 
 ### 近期行为变更
+
+#### 26.5.31A
+
+- 新增 `get_rent_number.py`，可单独调试 HeroSMS `getRentNumber` 租号接口。
+- 新增 `herosms_tool.py rent-run`，租号流程会查询余额、租号前活动列表、按 duration 分档申请号码、确认活动列表、进入轮询和用户输入模式。
+- `--duration` 支持多档小时公式，示例：`24x7,24x6,24x5,24x4,24x3,24x2,24,12`。
+- `rent-run` 成功确认号码存在于活动列表时，会记录申请 `unixtime` 和成功 duration。
+- `[验证码记录明细]` 会追加申请 duration，以及距离上次验证码或申请时间的等待时间，格式为 `X分Y秒`。
+- `rent-run --run-loop` 会在所有 duration 档位都未获得成功号码时重新读取 `.env` 并从头重跑。
 
 #### 26.5.30A
 
@@ -562,7 +630,31 @@ python3 get_number_v2.py --service dr --seed 7 --send
 
 ---
 
-### 7) get_active_activations.py
+### 7) get_rent_number.py
+
+用途：单次调试租号接口 `getRentNumber`。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `-s`, `--service` | `dr` | 服务代码 |
+| `--country` | `16` | 国家 ID；`16` 为英国，`6` 为印度尼西亚，`48` 为荷兰，`117` 为葡萄牙 |
+| `--duration` | `2` | 租号时长小时数；支持 `2、4、12、24、24x2、24*3` 分档；单档最大 `24x7=168` |
+| `--operator` | `any` | 商家/运营商代码 |
+| `--cost` | `None` | 价格参数；提供后传给接口 |
+| `--currency` | `None` | 币种参数；提供后传给接口 |
+| `--ref` | `None` | ref 参数；提供后传给接口 |
+| `--send` | 关闭 | 实际发送 `getRentNumber` 请求 |
+
+示例：
+
+```bash
+python3 get_rent_number.py --service dr --country 16 --duration 2、4、12、24、24x2、24x3 --cost 0.03
+python3 get_rent_number.py --service dr --country 16 --duration 2、4、12、24、24x2、24x3 --cost 0.03 --send
+```
+
+---
+
+### 8) get_active_activations.py
 
 用途：获取活动激活列表，并支持 `setStatus`。
 
@@ -598,7 +690,7 @@ python3 get_active_activations.py --set-status-id 363621340 --status 8 --no-list
 
 ---
 
-### 8) get_history.py
+### 9) get_history.py
 
 用途：查询历史记录。
 
@@ -628,7 +720,7 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 语法检查：
 
 ```powershell
-& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py tests\test_herosms_tool.py
+& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_rent_number.py tests\test_herosms_tool.py
 ```
 
 运行单元测试：
@@ -637,10 +729,10 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 & D:\0Code2\py312\python.exe -m pytest -q
 ```
 
-本次文档更新前已确认（2026-05-30）：
+本次文档更新前已确认（2026-05-31）：
 
-- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_prices.py tests\test_herosms_tool.py tests\test_get_prices.py tools\feishu.py` 通过
-- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `42 passed in 2.97s`
+- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_rent_number.py tests\test_herosms_tool.py` 通过
+- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `59 passed in 2.10s`
 
 ---
 
@@ -649,13 +741,14 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 本次会话主要变更集中在：
 
 - `README.md`：更新版本号、版本日志、今日任务梳理、近期行为变更、参数说明和验证记录
-- `herosms_tool.py`：新增验证码快照记录、验证码历史对比、用户输入轮询前刷新活动列表和 `3` 模式验证码基线对比
-- `tests/test_herosms_tool.py`：补充验证码记录、变化间隔、用户输入轮询刷新、刷新失败继续运行和 `3` 模式对比测试
+- `herosms_tool.py`：新增 `rent-run` 租号流程、duration 分档、租号号码确认、租号大循环和申请时间 / duration 记录
+- `get_rent_number.py`：新增 `getRentNumber` 单接口调试脚本和 duration 公式 / 分档解析
+- `tests/test_herosms_tool.py`：补充租号参数解析、分档重试、号码确认、验证码等待计时和 `rent-run --run-loop` 测试
 
 如需后续做版本提交，建议先：
 
 ```bash
-git add README.md herosms_tool.py tests/test_herosms_tool.py
+git add README.md herosms_tool.py get_rent_number.py tests/test_herosms_tool.py
 ```
 
 再继续检查 staged diff。

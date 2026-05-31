@@ -19,6 +19,8 @@ from herosms_tool import (
     parse_balance_value,
     parse_float_levels,
 )
+from get_number_v2 import build_request_params
+from get_rent_number import build_rent_number_params, parse_duration_hours, parse_duration_levels
 
 
 class FakeFeishuNotifier:
@@ -64,6 +66,106 @@ def test_parse_args_supports_run_loop():
     assert config.run_loop is True
 
 
+def test_parse_args_supports_rent_run_defaults():
+    args = parse_args(["rent-run"])
+
+    config = WorkflowConfig.from_args(args, env={})
+
+    assert config.command == "rent-run"
+    assert config.service == "dr"
+    assert config.rent_country == 16
+    assert config.rent_duration == 2
+    assert config.rent_duration_levels == (2,)
+    assert config.rent_operator == "any"
+    assert config.send is False
+
+
+def test_parse_args_supports_rent_run_options():
+    args = parse_args([
+        "rent-run",
+        "--service", "tg",
+        "--country", "2",
+        "--duration", "2、4、12、24、24*2、24*3",
+        "--operator", "airtel",
+        "--cost", "0.5",
+        "--currency", "840",
+        "--ref", "abc",
+    ])
+
+    config = WorkflowConfig.from_args(args, env={})
+
+    assert config.command == "rent-run"
+    assert config.service == "tg"
+    assert config.rent_country == 2
+    assert config.rent_duration == 72
+    assert config.rent_duration_levels == (2, 4, 12, 24, 48, 72)
+    assert config.rent_operator == "airtel"
+    assert config.rent_cost == "0.5"
+    assert config.rent_currency == "840"
+    assert config.rent_ref == "abc"
+
+
+def test_build_rent_number_params_includes_required_and_optional_fields():
+    params = build_rent_number_params(
+        service="tg",
+        country=2,
+        duration=4,
+        operator="airtel",
+        cost="0.5",
+        currency="840",
+        ref="abc",
+    )
+
+    assert params == {
+        "action": "getRentNumber",
+        "service": "tg",
+        "country": 2,
+        "duration": 4,
+        "operator": "airtel",
+        "cost": "0.5",
+        "currency": "840",
+        "ref": "abc",
+    }
+
+
+def test_build_rent_number_params_defaults_operator_any():
+    params = build_rent_number_params()
+
+    assert params["operator"] == "any"
+
+
+def test_parse_duration_hours_supports_formula():
+    assert parse_duration_hours("24") == 24
+    assert parse_duration_hours("24x2") == 48
+    assert parse_duration_hours("24*2") == 48
+    assert parse_duration_hours("24x7") == 168
+
+
+def test_parse_duration_levels_supports_multiple_duration_tiers():
+    assert parse_duration_levels("2、4、12、24、24*2、24*3") == (2, 4, 12, 24, 48, 72)
+
+
+def test_parse_duration_hours_rejects_more_than_seven_days():
+    with pytest.raises(ValueError, match="168"):
+        parse_duration_hours("24x8")
+
+
+def test_rent_run_duration_formula_is_converted_to_hours():
+    args = parse_args(["rent-run", "--duration", "24x2"])
+
+    config = WorkflowConfig.from_args(args, env={})
+
+    assert config.rent_duration == 48
+    assert config.rent_duration_levels == (48,)
+
+
+def test_get_number_v2_params_do_not_include_duration():
+    params = build_request_params({"service": "dr", "country": 16, "operator": "", "maxPrice": 0.03})
+
+    assert params["action"] == "getNumberV2"
+    assert "duration" not in params
+
+
 def test_parse_args_uses_environment_when_cli_omits_values():
     args = parse_args(["run"])
     env = {
@@ -105,6 +207,150 @@ def test_run_exits_when_balance_is_lower_than_max_price():
     workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
 
     assert workflow.run() == 1
+
+
+def test_rent_run_dry_run_prints_request_without_sending():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", command="rent-run", service="tg", rent_country=2, rent_duration_levels=(4, 12), rent_operator="airtel", rent_cost="0.5"),
+        logger=logging.getLogger("test"),
+    )
+    messages = []
+    called = {"request": False}
+    printed = []
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+    workflow.get_active_records = lambda limit=100: [{"activationId": "before"}]
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: printed.append((records, source))
+    workflow.request_rent_number = lambda: called.__setitem__("request", True)
+
+    assert workflow.run_rent_number() == 0
+    assert called["request"] is False
+    assert printed == [([{"activationId": "before"}], "租号前活动列表")]
+    assert any('"action": "getRentNumber"' in message for message in messages)
+    assert any('"duration": 4' in message for message in messages)
+    assert any('"duration": 12' in message for message in messages)
+    assert any("[租号模式] dry-run" in message for message in messages)
+
+
+def test_rent_run_send_requests_and_prints_active_records():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", command="rent-run", send=True),
+        logger=logging.getLogger("test"),
+    )
+    messages = []
+    printed = []
+    active_responses = [
+        [{"activationId": "before", "phoneNumber": "5550000"}],
+        [{"activationId": "rent1", "phoneNumber": "5550001"}],
+    ]
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+    workflow.request_rent_number = lambda duration=None: (200, {"phoneNumber": "5550001"})
+    workflow.get_active_records = lambda limit=100: active_responses.pop(0)
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: printed.append((records, source))
+    workflow.poll_active_list = lambda: printed.append(("polled", None))
+    workflow.user_input_loop = lambda: printed.append(("input_loop", None))
+    workflow.print_history = lambda: printed.append(("history", None))
+    workflow.feishu_notifier = FakeFeishuNotifier()
+
+    assert workflow.run_rent_number() == 0
+    assert printed == [
+        ([{"activationId": "before", "phoneNumber": "5550000"}], "租号前活动列表"),
+        ([{"activationId": "rent1", "phoneNumber": "5550001"}], "租号后活动列表"),
+        ("polled", None),
+        ("input_loop", None),
+        ("history", None),
+    ]
+    assert workflow.feishu_notifier.calls == [("+5550001", True)]
+    assert any("[租号确认] 电话号码 +5550001 存在于活动激活列表" in message for message in messages)
+
+
+def test_rent_run_infers_phone_from_new_active_record_when_payload_has_no_phone():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", command="rent-run", send=True),
+        logger=logging.getLogger("test"),
+    )
+    messages = []
+    active_responses = [
+        [{"activationId": "old1", "phoneNumber": "5550000"}],
+        [
+            {"activationId": "old1", "phoneNumber": "5550000"},
+            {"activationId": "rent1", "phoneNumber": "447916024621"},
+        ],
+    ]
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+    workflow.request_rent_number = lambda duration=None: (200, {"status": "ok"})
+    workflow.get_active_records = lambda limit=100: active_responses.pop(0)
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: None
+    workflow.poll_active_list = lambda: None
+    workflow.user_input_loop = lambda: None
+    workflow.print_history = lambda: None
+    workflow.feishu_notifier = FakeFeishuNotifier()
+
+    assert workflow.run_rent_number() == 0
+    assert workflow.feishu_notifier.calls == [("+447916024621", True)]
+    assert any("已从活动列表新增记录推断电话号码 +447916024621" in message for message in messages)
+    assert any("[租号确认] 电话号码 +447916024621 存在于活动激活列表" in message for message in messages)
+
+
+def test_rent_run_tries_duration_levels_until_success():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", command="rent-run", send=True, rent_duration_levels=(2, 4, 12)),
+        logger=logging.getLogger("test"),
+    )
+    messages = []
+    requested_durations = []
+    active_responses = [
+        [],
+        [{"activationId": "rent1", "phoneNumber": "5550012"}],
+    ]
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+
+    def fake_request(duration=None):
+        requested_durations.append(duration)
+        if duration == 2:
+            return 404, "NO_NUMBERS"
+        if duration == 4:
+            return 200, {"phoneNumber": "5550012"}
+        return 200, {"phoneNumber": "should-not-request"}
+
+    workflow.request_rent_number = fake_request
+    workflow.get_active_records = lambda limit=100: active_responses.pop(0)
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: None
+    workflow.poll_active_list = lambda: None
+    workflow.user_input_loop = lambda: None
+    workflow.print_history = lambda: None
+    workflow.feishu_notifier = FakeFeishuNotifier()
+
+    assert workflow.run_rent_number() == 0
+    assert requested_durations == [2, 4]
+    assert workflow.feishu_notifier.calls == [("+5550012", True)]
+    assert any("[租号分段失败] duration=2 HTTP=404" in message for message in messages)
+    assert any("[租号分段成功] duration=4" in message for message in messages)
+
+
+def test_rent_run_marks_restartable_when_all_duration_levels_fail():
+    workflow = HeroSMSWorkflow(
+        WorkflowConfig(api_key="k", command="rent-run", send=True, rent_duration_levels=(2, 4)),
+        logger=logging.getLogger("test"),
+    )
+    requested_durations = []
+    workflow.log_and_print = lambda message, level=logging.INFO: None
+    workflow.get_balance = lambda: "ACCESS_BALANCE:1.0"
+    workflow.get_active_records = lambda limit=100: []
+    workflow.print_and_record_active_records = lambda records, source, timeout_seconds=None: None
+
+    def fake_request(duration=None):
+        requested_durations.append(duration)
+        return 404, "NO_NUMBERS"
+
+    workflow.request_rent_number = fake_request
+
+    assert workflow.run_rent_number() == 1
+    assert requested_durations == [2, 4]
+    assert workflow.last_run_restartable is True
 
 
 def test_run_exits_in_single_thread_mode_when_active_list_is_not_empty(monkeypatch):
@@ -222,6 +468,33 @@ def test_execute_workflow_restarts_when_number_request_is_restartable(monkeypatc
 
     assert execute_workflow(args) == 0
     assert len(workflows) == 2
+    assert run_results == []
+
+
+def test_execute_workflow_restarts_rent_run_when_restartable(monkeypatch):
+    args = parse_args(["rent-run", "--run-loop", "--send", "--cost", "0.06"])
+    run_results = [1, 0]
+    workflows = []
+
+    class FakeWorkflow:
+        def __init__(self, config, logger):
+            self.config = config
+            self.logger = logger
+            self.last_run_restartable = True
+            workflows.append(self)
+
+        def run_rent_number(self):
+            result = run_results.pop(0)
+            self.last_run_restartable = result == 1
+            return result
+
+    monkeypatch.setattr("herosms_tool.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("herosms_tool.setup_logging", lambda log_dir: logging.getLogger("test"))
+    monkeypatch.setattr("herosms_tool.HeroSMSWorkflow", FakeWorkflow)
+
+    assert execute_workflow(args) == 0
+    assert len(workflows) == 2
+    assert all(workflow.config.command == "rent-run" for workflow in workflows)
     assert run_results == []
 
 
@@ -418,6 +691,49 @@ def test_sms_tracker_records_code_text_and_change_seconds():
     assert "不同间隔=25.5s" in summary
     assert "timeout=10s" in summary
     assert any("[验证码记录明细]" in message for message in messages)
+
+
+def test_sms_summary_uses_application_time_when_no_sms(monkeypatch):
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    monkeypatch.setattr("time.time", lambda: 1000.0)
+    messages = []
+    workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
+    records = [{"activationId": "rent1", "phoneNumber": "5550001"}]
+
+    workflow.record_application_context("5550001", records, duration_hours=48, source="rent-run")
+    workflow.sms_tracker.clock = lambda: 1085.0
+    workflow.record_sms_snapshots(records, source="测试未收到验证码")
+
+    summary = workflow.summarize_sms_history(records[0])
+    assert "申请unixtime=1000" in summary
+    assert "申请duration=48小时" in summary
+    assert "距上次验证码=1分25秒" in summary
+    assert "等待基准=号码申请时间" in summary
+    assert any("[号码申请记录]" in message for message in messages)
+
+
+def test_sms_summary_uses_last_sms_received_time_after_code_arrives(monkeypatch):
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    monkeypatch.setattr("time.time", lambda: 1000.0)
+    workflow.log_and_print = lambda message, level=logging.INFO: None
+    records = [{"activationId": "rent1", "phoneNumber": "5550001"}]
+
+    workflow.record_application_context("5550001", records, duration_hours=72, source="rent-run")
+    times = iter([1030.0, 1095.0])
+    workflow.sms_tracker.clock = lambda: next(times)
+    workflow.record_sms_snapshots(
+        [{"activationId": "rent1", "phoneNumber": "5550001", "smsCode": "111111"}],
+        source="首次验证码",
+    )
+    workflow.record_sms_snapshots(
+        [{"activationId": "rent1", "phoneNumber": "5550001", "smsCode": "111111"}],
+        source="再次观察同一验证码",
+    )
+
+    summary = workflow.summarize_sms_history({"activationId": "rent1", "phoneNumber": "5550001"})
+    assert "申请duration=72小时" in summary
+    assert "距上次验证码=1分5秒" in summary
+    assert "等待基准=上次验证码 smsCode=111111" in summary
 
 
 def test_user_input_zero_prints_active_list():

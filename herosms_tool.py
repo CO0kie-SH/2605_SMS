@@ -36,6 +36,7 @@ from get_history import print_history
 from get_number_v2 import build_request_params, parse_response_payload, print_response_payload
 from get_operator_prices import load_operator_prices
 from get_prices import build_get_number_v2_candidates
+from get_rent_number import build_rent_number_params, parse_duration_arg
 from get_service_coverage import build_coverage
 from tools.feishu import FeishuNotifier
 
@@ -101,6 +102,15 @@ class SmsSnapshot:
     display_value: str
     source: str
     timeout_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ActivationApplicationContext:
+    activation_id: str
+    phone: str
+    applied_unixtime: int
+    duration_hours: int | None = None
+    source: str = ""
 
 
 class SmsActivationTracker:
@@ -175,6 +185,19 @@ class SmsActivationTracker:
             return None
         return max(0.0, distinct[0].collected_at - distinct[1].collected_at)
 
+    @staticmethod
+    def received_sms_events(history: list[SmsSnapshot]) -> list[tuple[str, float]]:
+        events = []
+        last_value = ""
+        for snapshot in history:
+            if not snapshot.display_value:
+                continue
+            if snapshot.display_value == last_value:
+                continue
+            events.append((snapshot.display_value, snapshot.collected_at))
+            last_value = snapshot.display_value
+        return events
+
     def summarize(self, record: dict) -> str | None:
         activation_id, phone, sms_code, sms_text, display_value = self.extract_sms_identity(record)
         if not activation_id:
@@ -202,6 +225,7 @@ class SmsActivationTracker:
 
 @dataclass(frozen=True)
 class WorkflowConfig:
+    command: str = "run"
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     max_price: float | None = None
@@ -210,6 +234,13 @@ class WorkflowConfig:
     merchant_seed: int | None = None
     retry_limit: int = 10
     run_loop: bool = False
+    rent_duration: int = 2
+    rent_duration_levels: tuple[int, ...] = (2,)
+    rent_country: int = 16
+    rent_operator: str = "any"
+    rent_cost: str | None = None
+    rent_currency: str | None = None
+    rent_ref: str | None = None
     send: bool = False
     multi_thread: bool = False
     visible_only: bool = False
@@ -224,6 +255,10 @@ class WorkflowConfig:
     history_limit: int = 10
     log_dir: Path = PROJECT_DIR / "log"
 
+    def __post_init__(self) -> None:
+        if self.rent_duration_levels == (2,) and self.rent_duration != 2:
+            object.__setattr__(self, "rent_duration_levels", (self.rent_duration,))
+
     @classmethod
     def from_args(
         cls,
@@ -236,6 +271,7 @@ class WorkflowConfig:
         max_price_raw = args.max_price if args.max_price is not None else env.get("HEROSMS_MAX_PRICE")
         max_price_levels = parse_float_levels(max_price_raw)
         return cls(
+            command=args.run,
             api_key=api_key,
             base_url=base_url,
             max_price=max(max_price_levels) if max_price_levels else None,
@@ -244,6 +280,13 @@ class WorkflowConfig:
             merchant_seed=args.merchant_seed,
             retry_limit=args.retry_limit,
             run_loop=args.run_loop,
+            rent_duration=args.duration[-1],
+            rent_duration_levels=args.duration,
+            rent_country=args.country,
+            rent_operator=args.operator,
+            rent_cost=args.cost,
+            rent_currency=args.currency,
+            rent_ref=args.ref,
             send=args.send,
             multi_thread=args.multi_thread,
             visible_only=args.visible_only,
@@ -266,6 +309,8 @@ class HeroSMSWorkflow:
         self.logger = logger or logging.getLogger("herosms_tool")
         self.feishu_notifier = FeishuNotifier(logger=self.logger)
         self.sms_tracker = SmsActivationTracker()
+        self.application_context_by_activation_id: dict[str, ActivationApplicationContext] = {}
+        self.application_context_by_phone: dict[str, ActivationApplicationContext] = {}
         self.last_run_restartable = False
 
     def log_and_print(self, message: str, level: int = logging.INFO) -> None:
@@ -335,6 +380,25 @@ class HeroSMSWorkflow:
         payload = parse_response_payload(response)
         return response.status_code, payload
 
+    def build_rent_number_request_params(self, duration: int | None = None) -> dict:
+        return build_rent_number_params(
+            service=self.config.service,
+            country=self.config.rent_country,
+            duration=duration if duration is not None else self.config.rent_duration,
+            operator=self.config.rent_operator,
+            cost=self.config.rent_cost,
+            currency=self.config.rent_currency,
+            ref=self.config.rent_ref,
+        )
+
+    def request_rent_number(self, duration: int | None = None) -> tuple[int, object]:
+        params = self.build_rent_number_request_params(duration=duration)
+        self.log_and_print("[租号发送请求]")
+        self.log_and_print(json.dumps(params, ensure_ascii=False, indent=2))
+        response = self.api_get(**params)
+        payload = parse_response_payload(response)
+        return response.status_code, payload
+
     def poll_balance_change(self, before_balance: float | None) -> None:
         detected = False
         for index in range(self.config.balance_poll_times):
@@ -370,6 +434,14 @@ class HeroSMSWorkflow:
             return text
         return text if text.startswith("+") else f"+{digits}"
 
+    @staticmethod
+    def _format_elapsed_minutes_seconds(seconds: float | None) -> str:
+        if seconds is None:
+            return "-"
+        total_seconds = max(0, int(seconds))
+        minutes, remain_seconds = divmod(total_seconds, 60)
+        return f"{minutes}分{remain_seconds}秒"
+
     def extract_phone_number(self, payload) -> str:
         if isinstance(payload, dict):
             for key in ("phoneNumber", "phone", "number"):
@@ -397,6 +469,108 @@ class HeroSMSWorkflow:
                 if current and (current == wanted or current.endswith(wanted) or wanted.endswith(current)):
                     return True
         return False
+
+    def find_record_by_phone(self, phone_number: str, records: list[dict]) -> dict | None:
+        wanted = self._normalize_phone(phone_number)
+        if not wanted:
+            return None
+        for record in records:
+            phone = self._record_first_value(record, ("phoneNumber", "phone", "number"))
+            current = self._normalize_phone(phone)
+            if current and (current == wanted or current.endswith(wanted) or wanted.endswith(current)):
+                return record
+        return None
+
+    @staticmethod
+    def _record_first_value(record: dict, keys: Sequence[str]) -> str:
+        for key in keys:
+            value = str(record.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def infer_phone_from_new_active_record(self, records_before: list[dict], records_after: list[dict]) -> str:
+        # 租号接口有时不会在响应体里直接返回号码，这里用活动列表前后差异兜底推断本次号码。
+        before_ids = {
+            self._record_first_value(record, ("activationId", "id"))
+            for record in records_before
+        }
+        before_ids.discard("")
+        before_phones = {
+            self._normalize_phone(self._record_first_value(record, ("phoneNumber", "phone", "number")))
+            for record in records_before
+        }
+        before_phones.discard("")
+
+        candidates: list[str] = []
+        for record in records_after:
+            phone = self._record_first_value(record, ("phoneNumber", "phone", "number"))
+            if not phone:
+                continue
+            activation_id = self._record_first_value(record, ("activationId", "id"))
+            normalized_phone = self._normalize_phone(phone)
+            if before_ids and activation_id and activation_id not in before_ids:
+                candidates.append(phone)
+            elif not before_ids and normalized_phone and normalized_phone not in before_phones:
+                candidates.append(phone)
+
+        unique_candidates = []
+        seen = set()
+        for phone in candidates:
+            normalized_phone = self._normalize_phone(phone)
+            if normalized_phone in seen:
+                continue
+            seen.add(normalized_phone)
+            unique_candidates.append(phone)
+        if len(unique_candidates) == 1:
+            return unique_candidates[0]
+        if not records_before and len(records_after) == 1:
+            return self._record_first_value(records_after[0], ("phoneNumber", "phone", "number"))
+        return ""
+
+    def record_application_context(
+        self,
+        phone_number: str,
+        records: list[dict],
+        duration_hours: int | None = None,
+        source: str = "",
+    ) -> None:
+        record = self.find_record_by_phone(phone_number, records)
+        if record is None:
+            self.log_and_print(
+                f"[号码申请记录] 电话号码 {self._display_phone(phone_number)} 未在活动列表中匹配到记录，跳过申请时间记录",
+                logging.WARNING,
+            )
+            return
+        activation_id = self._record_first_value(record, ("activationId", "id"))
+        phone = self._record_first_value(record, ("phoneNumber", "phone", "number")) or phone_number
+        context = ActivationApplicationContext(
+            activation_id=activation_id,
+            phone=phone,
+            applied_unixtime=int(time.time()),
+            duration_hours=duration_hours,
+            source=source,
+        )
+        normalized_phone = self._normalize_phone(phone)
+        if activation_id:
+            self.application_context_by_activation_id[activation_id] = context
+        if normalized_phone:
+            self.application_context_by_phone[normalized_phone] = context
+        self.log_and_print(
+            f"[号码申请记录] 来源={source or '-'} activationId={activation_id or '-'} "
+            f"phone={self._display_phone(phone)} applied_unixtime={context.applied_unixtime} "
+            f"duration={duration_hours if duration_hours is not None else '-'}"
+        )
+
+    def get_application_context_for_record(self, record: dict) -> ActivationApplicationContext | None:
+        activation_id = self._record_first_value(record, ("activationId", "id"))
+        if activation_id and activation_id in self.application_context_by_activation_id:
+            return self.application_context_by_activation_id[activation_id]
+        phone = self._record_first_value(record, ("phoneNumber", "phone", "number"))
+        normalized_phone = self._normalize_phone(phone)
+        if normalized_phone:
+            return self.application_context_by_phone.get(normalized_phone)
+        return None
 
     def notify_phone_active_presence(self, phone_number: str, exists: bool) -> None:
         display_phone = self._display_phone(phone_number)
@@ -426,7 +600,29 @@ class HeroSMSWorkflow:
                 self.log_and_print(f"[验证码记录明细] {summary}")
 
     def summarize_sms_history(self, record: dict) -> str | None:
-        return self.sms_tracker.summarize(record)
+        summary = self.sms_tracker.summarize(record)
+        if not summary:
+            return None
+        context = self.get_application_context_for_record(record)
+        if context is None:
+            return summary
+
+        activation_id, _phone, _sms_code, _sms_text, _display_value = self.sms_tracker.extract_sms_identity(record)
+        history = self.sms_tracker.latest_history(activation_id)
+        sms_events = self.sms_tracker.received_sms_events(history)
+        latest_snapshot_time = history[-1].collected_at if history else time.time()
+        if sms_events:
+            reference_value, reference_time = sms_events[-1]
+            reference_text = f"上次验证码 {reference_value}"
+        else:
+            reference_time = float(context.applied_unixtime)
+            reference_text = "号码申请时间"
+        elapsed_text = self._format_elapsed_minutes_seconds(latest_snapshot_time - reference_time)
+        duration_text = "-" if context.duration_hours is None else f"{context.duration_hours}小时"
+        return (
+            f"{summary} 申请unixtime={context.applied_unixtime} 申请duration={duration_text} "
+            f"距上次验证码={elapsed_text} 等待基准={reference_text}"
+        )
 
     def print_and_record_active_records(
         self,
@@ -635,6 +831,7 @@ class HeroSMSWorkflow:
         phone_exists = self.phone_exists_in_records(result.phone, records_after)
         self.notify_phone_active_presence(result.phone, phone_exists)
         if phone_exists:
+            self.record_application_context(result.phone, records_after, source="9模式")
             self.log_and_print(f"[9模式确认] 电话号码 {self._display_phone(result.phone)} 存在于活动激活列表")
         else:
             self.log_and_print(
@@ -1054,6 +1251,7 @@ class HeroSMSWorkflow:
         phone_exists = self.phone_exists_in_records(number_result.phone, records_after)
         self.notify_phone_active_presence(number_result.phone, phone_exists)
         if phone_exists:
+            self.record_application_context(number_result.phone, records_after, source="run")
             self.log_and_print(f"[确认] 电话号码 {self._display_phone(number_result.phone)} 存在于活动激活列表")
         else:
             self.log_and_print(f"[警告] 电话号码 {self._display_phone(number_result.phone)} 不存在于活动激活列表，退出", logging.WARNING)
@@ -1076,6 +1274,126 @@ class HeroSMSWorkflow:
             self.log_and_print(f"[历史记录] 查询失败: {error}", logging.WARNING)
         return 0
 
+    def run_rent_number(self) -> int:
+        self.last_run_restartable = False
+        self.log_and_print("[租号流程] 1. 读取配置完成，开始查询余额")
+        try:
+            balance_text = self.get_balance()
+        except Exception as error:
+            self.log_and_print(f"[租号错误] 查询余额失败: {error}", logging.ERROR)
+            return 1
+
+        self.log_and_print(f"[租号余额] {balance_text}")
+        self.log_and_print("[租号流程] 2. 获取租号前活动激活列表")
+        records_before: list[dict] = []
+        try:
+            records_before = self.get_active_records(limit=self.config.active_limit)
+            self.print_and_record_active_records(records_before, source="租号前活动列表")
+        except Exception as error:
+            self.log_and_print(f"[租号警告] 查询租号前活动激活列表失败: {error}", logging.WARNING)
+
+        duration_levels = self.config.rent_duration_levels or (self.config.rent_duration,)
+        self.log_and_print("[租号接口说明] getRentNumber 用于申请租赁号码；duration 是租号时长，不用于普通 getNumberV2。")
+        self.log_and_print(f"[租号时长档位] {list(duration_levels)}")
+        for index, duration in enumerate(duration_levels, start=1):
+            request_params = self.build_rent_number_request_params(duration=duration)
+            self.log_and_print(f"[租号请求体预览] #{index}/{len(duration_levels)} duration={duration}")
+            self.log_and_print(json.dumps(request_params, ensure_ascii=False, indent=2))
+        if not self.config.send:
+            self.log_and_print("[租号模式] dry-run，未实际发送 getRentNumber 请求。加 --send 才会真实租号。")
+            return 0
+
+        records_after: list[dict] = []
+        payload: object | None = None
+        rent_phone = ""
+        selected_duration: int | None = None
+        for index, duration in enumerate(duration_levels, start=1):
+            self.log_and_print(f"[租号分段] #{index}/{len(duration_levels)} 尝试 duration={duration}")
+            try:
+                status_code, current_payload = self.request_rent_number(duration=duration)
+            except Exception as error:
+                self.log_and_print(f"[租号请求失败] duration={duration} error={error}", logging.WARNING)
+                continue
+
+            self.log_and_print(f"[租号HTTP状态] duration={duration} HTTP={status_code}")
+            print_response_payload(current_payload)
+            if status_code != 200:
+                self.log_and_print(f"[租号分段失败] duration={duration} HTTP={status_code}，继续尝试下一档", logging.WARNING)
+                continue
+
+            self.log_and_print(f"[租号分段] duration={duration} 获得 HTTP 200，开始确认是否实际获得号码")
+            current_records_after: list[dict] = []
+            try:
+                current_records_after = self.get_active_records(limit=self.config.active_limit)
+                self.print_and_record_active_records(current_records_after, source="租号后活动列表")
+            except Exception as error:
+                self.log_and_print(f"[租号警告] 查询活动激活列表失败: {error}", logging.WARNING)
+
+            current_phone = self.extract_phone_number(current_payload)
+            if current_phone:
+                self.log_and_print(f"[租号确认准备] 响应中提取到电话号码 {self._display_phone(current_phone)}")
+            else:
+                current_phone = self.infer_phone_from_new_active_record(records_before, current_records_after)
+                if current_phone:
+                    self.log_and_print(
+                        f"[租号确认准备] 响应未直接返回号码，已从活动列表新增记录推断电话号码 {self._display_phone(current_phone)}"
+                    )
+
+            if current_phone:
+                payload = current_payload
+                records_after = current_records_after
+                rent_phone = current_phone
+                selected_duration = duration
+                self.log_and_print(f"[租号分段成功] duration={duration} 已确认获得号码 {self._display_phone(rent_phone)}")
+                break
+            self.log_and_print(
+                f"[租号分段失败] duration={duration} HTTP=200 但未确认获得号码，继续尝试下一档",
+                logging.WARNING,
+            )
+
+        if payload is None or selected_duration is None:
+            self.last_run_restartable = True
+            self.log_and_print("[租号失败] 所有时长档位均未获得成功响应", logging.ERROR)
+            return 1
+
+        self.log_and_print(f"[租号流程] 3. 已完成租号后活动激活列表快照，成功时长={selected_duration}")
+
+        if rent_phone and records_after:
+            phone_exists = self.phone_exists_in_records(rent_phone, records_after)
+            self.notify_phone_active_presence(rent_phone, phone_exists)
+            if phone_exists:
+                self.record_application_context(rent_phone, records_after, duration_hours=selected_duration, source="rent-run")
+                self.log_and_print(f"[租号确认] 电话号码 {self._display_phone(rent_phone)} 存在于活动激活列表")
+            else:
+                self.log_and_print(
+                    f"[租号警告] 电话号码 {self._display_phone(rent_phone)} 不存在于活动激活列表，退出",
+                    logging.WARNING,
+                )
+                return 1
+        elif rent_phone:
+            self.log_and_print(
+                f"[租号警告] 已获得电话号码 {self._display_phone(rent_phone)}，但活动激活列表为空或查询失败，无法确认是否存在",
+                logging.WARNING,
+            )
+        else:
+            self.log_and_print("[租号警告] 响应和活动列表中未能确定本次租号号码，跳过号码存在性确认", logging.WARNING)
+
+        self.log_and_print("[租号流程] 4. 轮询活动激活列表")
+        self.poll_active_list()
+
+        self.log_and_print("[租号流程] 5. 用户输入模式轮询")
+        try:
+            self.user_input_loop()
+        except UserInputExit:
+            self.log_and_print("[退出] 用户输入 99，退出租号用户输入轮询")
+
+        self.log_and_print("[租号流程] 6. 查询用户历史并退出")
+        try:
+            self.print_history()
+        except Exception as error:
+            self.log_and_print(f"[租号历史记录] 查询失败: {error}", logging.WARNING)
+        return 0
+
 
 def setup_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1091,7 +1409,7 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="HeroSMS 合法调试工作流统一入口")
-    parser.add_argument("run", nargs="?", default="run", help="执行完整工作流，默认 run")
+    parser.add_argument("run", nargs="?", default="run", choices=("run", "rent-run"), help="执行模式：run 普通号码；rent-run 租号")
     parser.add_argument("--api-key", default=None, help="HeroSMS API Key；优先级高于 HEROSMS_API_KEY")
     parser.add_argument("--base-url", default=None, help="API 地址；优先级高于 HEROSMS_BASE_URL")
     parser.add_argument("-s", "--service", default="dr", help="服务代码，默认 dr")
@@ -1103,6 +1421,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--merchant-seed", type=int, default=None, help="商户抽取随机种子")
     parser.add_argument("--retry-limit", type=int, default=10, help="获取商户/号码累计重试次数上限，超过后退出，默认 10")
     parser.add_argument("--run-loop", action="store_true", help="号码申请失败时重新读取 env 并从头重跑整个流程")
+    parser.add_argument("--country", type=int, default=16, help="租号国家 ID，rent-run 默认 16")
+    parser.add_argument(
+        "--duration",
+        type=parse_duration_arg,
+        default=(2,),
+        help="租号时长小时数，仅 rent-run 使用；支持 2、4、24x2 或 24*2 多档，单档最大 168",
+    )
+    parser.add_argument("--operator", default="any", help="租号商家/运营商，仅 rent-run 使用，默认 any")
+    parser.add_argument("--cost", default=None, help="租号价格参数，仅 rent-run 使用；提供后传给接口")
+    parser.add_argument("--currency", default=None, help="租号币种参数，仅 rent-run 使用")
+    parser.add_argument("--ref", default=None, help="租号 ref 参数，仅 rent-run 使用")
     parser.add_argument("--send", action="store_true", help="真实发送号码请求；默认 dry-run")
     parser.add_argument("--multi-thread", action="store_true", help="启用多线程模式预留开关；当前仅作为跳过单线程检查")
     parser.add_argument("--visible-only", action="store_true", help="只从 visible=1 的国家中选择")
@@ -1131,7 +1460,10 @@ def execute_workflow(args: argparse.Namespace) -> int:
 
         logger = setup_logging(config.log_dir)
         workflow = HeroSMSWorkflow(config=config, logger=logger)
-        result = workflow.run()
+        if config.command == "rent-run":
+            result = workflow.run_rent_number()
+        else:
+            result = workflow.run()
         if result == 0:
             return 0
         if not config.run_loop or not workflow.last_run_restartable:
