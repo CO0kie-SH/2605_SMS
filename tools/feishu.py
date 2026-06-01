@@ -114,3 +114,20 @@ class FeishuNotifier:
         status_text = "存在于当前激活列表" if exists else "不存在于当前激活列表"
         body = f"号码 {phone} {status_text}"
         return self.send_message(body, title="HeroSMS 号码激活列表确认", tag=tag)
+
+    def notify_sms_code(
+        self,
+        phone: str,
+        sms_code: str,
+        sms_text: str = "",
+        code_index: int | None = None,
+        tag: str | None = None,
+    ) -> dict[str, bool]:
+        index_text = f"第 {code_index} 次" if code_index is not None else "新"
+        body_lines = [
+            f"号码：{phone}",
+            f"{index_text}验证码：{sms_code}",
+        ]
+        if sms_text:
+            body_lines.append(f"短信内容：{sms_text}")
+        return self.send_message("\n".join(body_lines), title="HeroSMS 收到验证码", tag=tag)

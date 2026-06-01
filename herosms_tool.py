@@ -309,6 +309,8 @@ class HeroSMSWorkflow:
         self.logger = logger or logging.getLogger("herosms_tool")
         self.feishu_notifier = FeishuNotifier(logger=self.logger)
         self.sms_tracker = SmsActivationTracker()
+        self.notified_sms_codes_by_activation_id: dict[str, set[str]] = {}
+        self.notified_sms_codes_by_phone: dict[str, set[str]] = {}
         self.application_context_by_activation_id: dict[str, ActivationApplicationContext] = {}
         self.application_context_by_phone: dict[str, ActivationApplicationContext] = {}
         self.last_run_restartable = False
@@ -579,6 +581,49 @@ class HeroSMSWorkflow:
         except Exception as error:
             self.log_and_print(f"[飞书通知] 发送失败: {error}", logging.WARNING)
 
+    def notify_new_sms_codes(self, snapshots: list[SmsSnapshot]) -> None:
+        for snapshot in snapshots:
+            sms_code = str(snapshot.sms_code or "").strip()
+            if not sms_code:
+                continue
+            activation_id = str(snapshot.activation_id or "").strip()
+            normalized_phone = self._normalize_phone(snapshot.phone)
+            activation_codes = self.notified_sms_codes_by_activation_id.setdefault(activation_id, set()) if activation_id else set()
+            phone_codes = self.notified_sms_codes_by_phone.setdefault(normalized_phone, set()) if normalized_phone else set()
+            if sms_code in activation_codes or sms_code in phone_codes:
+                continue
+
+            history = self.sms_tracker.latest_history(activation_id) if activation_id else []
+            code_history = []
+            seen_codes = set()
+            if history:
+                for history_snapshot in history:
+                    history_code = str(history_snapshot.sms_code or "").strip()
+                    if not history_code or history_code in seen_codes:
+                        continue
+                    seen_codes.add(history_code)
+                    code_history.append(history_code)
+                code_index = len(code_history) if sms_code in seen_codes else len(code_history) + 1
+            else:
+                code_index = len(phone_codes) + 1
+            display_phone = self._display_phone(snapshot.phone)
+            try:
+                self.feishu_notifier.notify_sms_code(
+                    display_phone,
+                    sms_code,
+                    sms_text=snapshot.sms_text,
+                    code_index=code_index,
+                )
+                if activation_id:
+                    activation_codes.add(sms_code)
+                if normalized_phone:
+                    phone_codes.add(sms_code)
+                self.log_and_print(
+                    f"[飞书验证码] 已发送 phone={display_phone} smsCode={sms_code} 第{code_index}次 来源={snapshot.source}"
+                )
+            except Exception as error:
+                self.log_and_print(f"[飞书验证码] 发送失败 phone={display_phone} smsCode={sms_code}: {error}", logging.WARNING)
+
     def print_active_records(self, records: list[dict]) -> None:
         print_active_activations(records)
         self.logger.info("active_records=%s", json.dumps(records, ensure_ascii=False, default=str))
@@ -594,6 +639,7 @@ class HeroSMSWorkflow:
         self.log_and_print(
             f"[验证码记录] 来源={source} 记录数量={len(snapshots)} timeout={timeout_seconds if timeout_seconds is not None else '-'}"
         )
+        self.notify_new_sms_codes(snapshots)
         for record in records:
             summary = self.summarize_sms_history(record)
             if summary:

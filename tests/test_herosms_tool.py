@@ -26,9 +26,14 @@ from get_rent_number import build_rent_number_params, parse_duration_hours, pars
 class FakeFeishuNotifier:
     def __init__(self):
         self.calls = []
+        self.sms_calls = []
 
     def notify_phone_active_presence(self, phone, exists):
         self.calls.append((phone, exists))
+        return {"test": True}
+
+    def notify_sms_code(self, phone, sms_code, sms_text="", code_index=None):
+        self.sms_calls.append((phone, sms_code, sms_text, code_index))
         return {"test": True}
 
 
@@ -670,6 +675,7 @@ def test_phone_presence_checks_common_fields():
 
 def test_sms_tracker_records_code_text_and_change_seconds():
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    workflow.feishu_notifier = FakeFeishuNotifier()
     times = iter([100.0, 125.5])
     workflow.sms_tracker.clock = lambda: next(times)
     messages = []
@@ -693,8 +699,51 @@ def test_sms_tracker_records_code_text_and_change_seconds():
     assert any("[验证码记录明细]" in message for message in messages)
 
 
+def test_sms_code_feishu_notifies_each_distinct_code_once():
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    workflow.feishu_notifier = FakeFeishuNotifier()
+    workflow.log_and_print = lambda message, level=logging.INFO: None
+
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsCode": "111111", "smsText": "first"}],
+        source="首次",
+    )
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsCode": "111111", "smsText": "first repeat"}],
+        source="重复",
+    )
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsCode": "222222", "smsText": "second"}],
+        source="第二次",
+    )
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsCode": "333333", "smsText": "third"}],
+        source="第三次",
+    )
+
+    assert workflow.feishu_notifier.sms_calls == [
+        ("+5550001", "111111", "first", 1),
+        ("+5550001", "222222", "second", 2),
+        ("+5550001", "333333", "third", 3),
+    ]
+
+
+def test_sms_code_feishu_skips_records_without_code():
+    workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    workflow.feishu_notifier = FakeFeishuNotifier()
+    workflow.log_and_print = lambda message, level=logging.INFO: None
+
+    workflow.record_sms_snapshots(
+        [{"activationId": "a1", "phoneNumber": "5550001", "smsText": "no structured code"}],
+        source="无code",
+    )
+
+    assert workflow.feishu_notifier.sms_calls == []
+
+
 def test_sms_summary_uses_application_time_when_no_sms(monkeypatch):
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    workflow.feishu_notifier = FakeFeishuNotifier()
     monkeypatch.setattr("time.time", lambda: 1000.0)
     messages = []
     workflow.log_and_print = lambda message, level=logging.INFO: messages.append(message)
@@ -714,6 +763,7 @@ def test_sms_summary_uses_application_time_when_no_sms(monkeypatch):
 
 def test_sms_summary_uses_last_sms_received_time_after_code_arrives(monkeypatch):
     workflow = HeroSMSWorkflow(WorkflowConfig(api_key="k"), logger=logging.getLogger("test"))
+    workflow.feishu_notifier = FakeFeishuNotifier()
     monkeypatch.setattr("time.time", lambda: 1000.0)
     workflow.log_and_print = lambda message, level=logging.INFO: None
     records = [{"activationId": "rent1", "phoneNumber": "5550001"}]

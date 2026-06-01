@@ -1,7 +1,7 @@
 # HeroSMS Python 调试工具集
 
-> 当前版本：`26.5.31A`  
-> 最后更新：`2026-05-31`  
+> 当前版本：`26.6.1A`  
+> 最后更新：`2026-06-01`  
 > 项目定位：合法合规地调试 HeroSMS / SMS-Activate 风格 API，重点用于观察余额、价格、库存、号码请求、活动激活状态、状态变更与完整工作流。
 
 ---
@@ -24,6 +24,7 @@
 - 支持号码申请失败后的 `--run-loop` 大循环，从头重新读取配置、余额、活动列表与商户候选
 - 支持通过 `tools/feishu.py` 在号码活动列表确认阶段发送飞书通知
 - 支持用户输入轮询期间持续记录验证码快照，展示当前、上次、上上次验证码与变化间隔
+- 支持新 `smsCode` 到达时发送飞书验证码通知，按号码记录第 1 / 2 / 3 / ... 次不同验证码
 - 支持 `getRentNumber` 租号接口、租号时长分档试探和 `rent-run --run-loop` 失败后整体重跑
 - 租号成功进入活动列表后会记录申请时间 `unixtime`、成功 duration，并在验证码记录里输出等待时长
 - 支持交互式将激活状态改为 `3`（请求重发短信）、`6`（完成）或 `8`（退款）
@@ -40,6 +41,7 @@
 
 | 版本 | 日期 | 说明 |
 |---|---|---|
+| `26.6.1A` | 2026-06-01 | 新增验证码飞书通知能力：活动列表刷新并记录验证码快照时，会识别同一 `activationId` / 号码下新出现的 `smsCode`，按第 1 / 2 / 3 / ... 次记录并通过飞书推送号码、验证码和短信内容；同一验证码只通知一次，后续相同验证码轮询不会重复发送；日志新增 `[飞书验证码]` 成功/失败记录；补充单元测试覆盖不同验证码多次通知和无 `smsCode` 不通知 |
 | `26.5.31A` | 2026-05-31 | 新增 `getRentNumber` 租号接口支持，提供 `get_rent_number.py` 单接口脚本与 `herosms_tool.py rent-run` 独立流程；租号流程会查询余额、租号前活动列表、按 duration 分档请求、确认号码是否进入活动列表并进入原有轮询；`--duration` 支持 `24x7,24x6,...` 多档小时公式，单档最大 168 小时；`operator` 默认 `any`；`rent-run --run-loop` 在所有时长档位失败时会重新读取 `.env` 并从头重跑；租号成功后记录申请 `unixtime` 和成功 duration，验证码记录明细追加距离上次验证码/申请时间的等待分钟秒；补充国家备注、README 示例与单元测试 |
 | `26.5.30A` | 2026-05-30 | 新增验证码观察记录能力：用户输入轮询每轮等待前刷新活动激活列表，记录 activationId、号码、smsCode、smsText、采集时间和等待 timeout；活动列表输出后追加验证码摘要，展示当前、上次、上上次验证码以及与上一次不同验证码的间隔秒数；增强 `3` 请求重发短信模式的验证码基线与刷新后对比；补充中文日志、中文注释和单元测试 |
 | `26.5.28A` | 2026-05-28 | 新增 `tools/feishu.py` 飞书通知工具类，在普通号码申请和 `9-序号` 重开新号的活动列表确认阶段播报“号码是否存在于当前激活列表”；新增 `--run-loop` 大循环命令行参数，当号码申请阶段商户列表耗尽并未获得成功号码响应时，重新读取 `.env` 并从余额、活动列表、商户生成开始整体重跑；补充 README 与单元测试覆盖 |
@@ -162,7 +164,20 @@ HEROSMS_MAX_PRICE=0.025-0.03-0.035
 - 默认是单线程保护模式，活动列表非空时会阻止继续请求新号码
 - `status=8` 退款时，如果记录中已有 `smsCode` 或 `smsText`，会拒绝退款
 
-### 今日任务梳理（26.5.31A）
+### 今日任务梳理（26.6.1A）
+
+本版本围绕 `smsCode` 到达后的飞书提醒和多次验证码记录做了以下更新：
+
+1. `tools/feishu.py` 新增 `notify_sms_code()`，用于发送验证码通知。
+2. `herosms_tool.py` 在 `record_sms_snapshots()` 验证码快照记录后，自动识别新出现的 `smsCode`。
+3. 飞书验证码通知包含手机号、`smsCode`、`smsText` 和当前是第几次不同验证码。
+4. 同一个 `activationId` / 号码下，同一个 `smsCode` 只发送一次，避免每轮活动列表轮询重复提醒。
+5. 同一号码后续出现不同验证码时，会继续按第 2 次、第 3 次、第 4 次等顺序记录并发送，支持 3 次、9 次或更多次。
+6. 日志新增 `[飞书验证码] 已发送 phone=... smsCode=... 第N次 来源=...`，便于从日志确认是否推送成功。
+7. 从 2026-06-01 日志确认，`smsCode=644013` 已触发飞书消息，`T2026` 与 `F2026` 均显示发送成功。
+8. 补充单元测试，覆盖不同验证码只通知一次、重复验证码不重复通知、无 `smsCode` 不通知。
+
+### 历史任务梳理（26.5.31A）
 
 本版本围绕 HeroSMS 租号接口 `getRentNumber`、分段时长申请和租号后的验证码观察做了以下更新：
 
@@ -437,6 +452,14 @@ python herosms_tool.py rent-run --service dr --country 16 --duration 24x7,24x6,2
 4. 价格符合限额时，复用普通号码申请的重试循环继续申请号码。
 
 ### 近期行为变更
+
+#### 26.6.1A
+
+- 新增 `smsCode` 飞书通知；活动列表刷新时只要发现新验证码，就会发送号码、验证码和短信内容。
+- 同一号码同一验证码只通知一次，后续轮询看到相同 `smsCode` 不会重复推送。
+- 同一号码多次收到不同验证码时，会按第 1 / 2 / 3 / ... 次记录和提醒。
+- 日志新增 `[飞书验证码]`，可直接确认验证码消息是否已发送。
+- 已从 2026-06-01 日志确认：`smsCode=644013` 触发飞书通知，`T2026` 和 `F2026` 均发送成功。
 
 #### 26.5.31A
 
@@ -720,7 +743,7 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 语法检查：
 
 ```powershell
-& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_rent_number.py tests\test_herosms_tool.py
+& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py tools\feishu.py tests\test_herosms_tool.py
 ```
 
 运行单元测试：
@@ -729,10 +752,10 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 & D:\0Code2\py312\python.exe -m pytest -q
 ```
 
-本次文档更新前已确认（2026-05-31）：
+本次文档更新前已确认（2026-06-01）：
 
-- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py get_rent_number.py tests\test_herosms_tool.py` 通过
-- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `59 passed in 2.10s`
+- `& D:\0Code2\py312\python.exe -m py_compile herosms_tool.py tools\feishu.py tests\test_herosms_tool.py` 通过
+- `& D:\0Code2\py312\python.exe -m pytest -q` 通过，结果为 `61 passed in 3.79s`
 
 ---
 
@@ -741,14 +764,14 @@ python3 get_history.py --no-time-range --offset 0 --size 50
 本次会话主要变更集中在：
 
 - `README.md`：更新版本号、版本日志、今日任务梳理、近期行为变更、参数说明和验证记录
-- `herosms_tool.py`：新增 `rent-run` 租号流程、duration 分档、租号号码确认、租号大循环和申请时间 / duration 记录
-- `get_rent_number.py`：新增 `getRentNumber` 单接口调试脚本和 duration 公式 / 分档解析
-- `tests/test_herosms_tool.py`：补充租号参数解析、分档重试、号码确认、验证码等待计时和 `rent-run --run-loop` 测试
+- `herosms_tool.py`：新增验证码快照后的新 `smsCode` 识别、去重和飞书通知触发
+- `tools/feishu.py`：新增 `notify_sms_code()` 验证码消息发送方法
+- `tests/test_herosms_tool.py`：补充验证码飞书通知、重复验证码去重和无 `smsCode` 不通知测试
 
 如需后续做版本提交，建议先：
 
 ```bash
-git add README.md herosms_tool.py get_rent_number.py tests/test_herosms_tool.py
+git add README.md herosms_tool.py tools/feishu.py tests/test_herosms_tool.py
 ```
 
 再继续检查 staged diff。
